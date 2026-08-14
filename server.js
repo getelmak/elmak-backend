@@ -283,28 +283,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-    if (fs.existsSync(filePath)) {
-      const ext = path.extname(filePath).toLowerCase();
-      const mimeTypes = {
-        '.html': 'text/html; charset=utf-8',
-        '.js': 'application/javascript',
-        '.json': 'application/json',
-        '.css': 'text/css',
-        '.png': 'image/png',
-        '.jpg': 'image/jpeg',
-        '.jpeg': 'image/jpeg',
-        '.ico': 'image/x-icon',
-        '.wasm': 'application/wasm',
-        '.ttf': 'font/ttf',
-        '.otf': 'font/otf',
-      };
-      const contentType = mimeTypes[ext] || 'application/octet-stream';
-      res.writeHead(200, { 'Content-Type': contentType });
-      fs.createReadStream(filePath).pipe(res);
-      return;
-    }
-  }
-
   // Active Users List
   if (pathname === '/api/users' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
