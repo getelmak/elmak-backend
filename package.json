@@ -1,0 +1,14 @@
+{
+  "name": "elmak-backend",
+  "version": "1.2.0",
+  "description": "Elmak Real-Time Ultra-Fast Messaging Engine 24/7 Cloud Backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Elmak Team",
+  "license": "MIT"
+}
