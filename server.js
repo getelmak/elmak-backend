@@ -236,7 +236,38 @@ const server = http.createServer((req, res) => {
   }
 
   // MEDIA UPLOAD
-  if (pathname === '/api/media/upload' && req.method === 'POST') {
+  // Media Upload Endpoint (محسّن – يدعم الصوتيات والصور والملفات)
+if (pathname === '/api/media/upload' && req.method === 'POST') {
+
+  // اسم الملف الأصلي القادم من التطبيق
+  const originalName = req.headers['x-file-name'] || `file_${Date.now()}`;
+
+  // استخراج الامتداد الحقيقي (مثال: .mp3 / .png / .mp4)
+  const ext = path.extname(originalName) || '.bin';
+
+  // نوع الملف الحقيقي (MIME type)
+  const mime = req.headers['x-file-type'] || 'application/octet-stream';
+
+  // اسم الملف النهائي داخل السيرفر
+  const filename = `elmak_${Date.now()}_${Math.floor(Math.random() * 1000)}${ext}`;
+  const filepath = path.join(UPLOADS_DIR, filename);
+
+  // حفظ الملف
+  const writeStream = fs.createWriteStream(filepath);
+  req.pipe(writeStream);
+
+  writeStream.on('finish', () => {
+    res.writeHead(201, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      file_id: filename,
+      file_url: `/api/media/${filename}`,
+      mime: mime,            // ← مهم جداً لتشغيل الصوتيات والصور
+      original_name: originalName
+    }));
+  });
+
+  return;
+}
     const filename = `elmak_${Date.now()}_${Math.floor(Math.random() * 1000)}.bin`;
     const filepath = path.join(UPLOADS_DIR, filename);
     const writeStream = fs.createWriteStream(filepath);
@@ -634,6 +665,8 @@ function getWebClientHTML() {
             } else {
               textContent = data.payload?.text || data.text || '';
             }
+            const mime = data.mime || data.payload?.mime || null;
+const fileUrl = data.file_url || data.payload?.file_url || null;
 
             const msgId = data.client_message_id || data.message_id || 'm_' + Date.now();
             
@@ -641,11 +674,16 @@ function getWebClientHTML() {
             const existing = chats[peer].find(m => m.id === msgId);
             if (!existing) {
               chats[peer].push({
-                id: msgId,
-                sender: sender,
-                text: textContent,
-                status: isFromMe ? 'sent' : 'delivered',
-                time: new Date().toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' })
+  id: msgId,
+  sender: sender,
+  text: textContent,
+  mime: mime,
+  file_url: fileUrl,
+  status: isFromMe ? 'sent' : 'delivered',
+  timestamp: data.timestamp,
+  time: new Date(data.timestamp).toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' })
+});
+                chats[peer].sort((a, b) => a.timestamp - b.timestamp);
               });
               renderChatList();
               if (activePeer === peer) renderMessages();
@@ -746,6 +784,13 @@ function getWebClientHTML() {
         div.className = 'msg-bubble ' + (isMe ? 'msg-me' : 'msg-peer');
         div.innerHTML = `
           <div>${msg.text}</div>
+  if (msg.mime && msg.mime.startsWith('audio/')) {
+  div.innerHTML += `
+    <audio controls style="width:100%; margin-top:8px;">
+      <source src="${msg.file_url}" type="${msg.mime}">
+    </audio>
+  `;
+}
           ${msg.translated ? `<div style="margin-top:4px; font-size:12px; color:var(--gold); border-top:1px dashed rgba(255,255,255,0.2); padding-top:4px;">✨ ترجمة (${msg.detected || 'فصحى'}): ${msg.translated}</div>` : ''}
           <div class="msg-meta">
             <span>${msg.time}</span>
