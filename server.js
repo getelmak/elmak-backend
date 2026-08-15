@@ -13,7 +13,6 @@ let WebSocket;
 try {
   WebSocket = require('ws');
 } catch (e) {
-  // Fallback if ws module is loading
   console.log('[Server] Loading fallback...');
 }
 
@@ -26,21 +25,23 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 }
 
 // In-Memory State
-const users = new Map(); // username -> { username, displayName, token, online: true, lastSeen }
-const sockets = new Map(); // username -> Set<WebSocket>
-const messagesHistory = new Map(); // chatId -> Array<Message>
+const users = new Map(); 
+const sockets = new Map(); 
+const messagesHistory = new Map();
 
+// ============================================================================
+// MESSAGE HANDLER
+// ============================================================================
 function handleMessage(senderSocket, msg) {
   if (!msg || !msg.type) return;
 
-  // 1. Authentication
+  // AUTH
   if (msg.type === 'auth') {
     const user = (msg.username || '').trim().toLowerCase();
     if (user) {
       senderSocket.username = user;
-      if (!sockets.has(user)) {
-        sockets.set(user, new Set());
-      }
+
+      if (!sockets.has(user)) sockets.set(user, new Set());
       sockets.get(user).add(senderSocket);
 
       const token = msg.token || crypto.randomBytes(16).toString('hex');
@@ -63,21 +64,19 @@ function handleMessage(senderSocket, msg) {
       sendToSocket(senderSocket, { type: 'auth_ok', username: user, token: token });
       console.log(`[ELMAK WS] Authenticated @${user}`);
 
-      // Replay all undelivered or historic messages for this user
+      // Replay history
       for (const [chatId, list] of messagesHistory.entries()) {
         for (const m of list) {
           const r = (m.recipient || '').toLowerCase().trim();
           const s = (m.sender || '').toLowerCase().trim();
-          if (r === user || s === user) {
-            sendToSocket(senderSocket, m);
-          }
+          if (r === user || s === user) sendToSocket(senderSocket, m);
         }
       }
     }
     return;
   }
 
-  // 2. Real-Time Message Dispatch
+  // MESSAGE DISPATCH
   if (msg.type === 'message') {
     const recipient = (msg.recipient || '').trim().toLowerCase();
     const sender = (senderSocket.username || msg.sender || '').trim().toLowerCase();
@@ -88,44 +87,33 @@ function handleMessage(senderSocket, msg) {
     const chatId = msg.chat_id || ('chat_' + [sender, recipient].sort().join('_'));
     msg.chat_id = chatId;
 
-    // Save in history
-    if (!messagesHistory.has(chatId)) {
-      messagesHistory.set(chatId, []);
-    }
+    if (!messagesHistory.has(chatId)) messagesHistory.set(chatId, []);
     messagesHistory.get(chatId).push(msg);
 
-    console.log(`[ELMAK WS] Dispatching message: @${sender} ➔ @${recipient} (${chatId})`);
+    console.log(`[ELMAK WS] Dispatching message: @${sender} ➔ @${recipient}`);
 
-    // Deliver to recipient sockets
     if (recipient && sockets.has(recipient)) {
-      for (const client of sockets.get(recipient)) {
-        sendToSocket(client, msg);
-      }
+      for (const client of sockets.get(recipient)) sendToSocket(client, msg);
     }
 
-    // Echo to sender other sockets if any
     if (sender && sockets.has(sender)) {
       for (const client of sockets.get(sender)) {
-        if (client !== senderSocket) {
-          sendToSocket(client, msg);
-        }
+        if (client !== senderSocket) sendToSocket(client, msg);
       }
     }
     return;
   }
 
-  // 3. Delivery ACK (Double Check ✓✓)
+  // DELIVERY ACK
   if (msg.type === 'delivery_ack') {
     const recipient = (msg.recipient || '').trim().toLowerCase();
     if (recipient && sockets.has(recipient)) {
-      for (const client of sockets.get(recipient)) {
-        sendToSocket(client, msg);
-      }
+      for (const client of sockets.get(recipient)) sendToSocket(client, msg);
     }
     return;
   }
 
-  // 4. Zero-Trace Delete
+  // DELETE
   if (msg.type === 'delete') {
     const chatId = msg.chat_id;
     const messageId = msg.message_id;
@@ -136,7 +124,6 @@ function handleMessage(senderSocket, msg) {
       messagesHistory.set(chatId, filtered);
     }
 
-    // Broadcast delete to all connected clients
     for (const [user, clientSet] of sockets.entries()) {
       for (const client of clientSet) {
         sendToSocket(client, {
@@ -150,7 +137,7 @@ function handleMessage(senderSocket, msg) {
     return;
   }
 
-  // 5. Edit Message
+  // EDIT
   if (msg.type === 'edit') {
     const chatId = msg.chat_id;
     const messageId = msg.message_id;
@@ -166,14 +153,12 @@ function handleMessage(senderSocket, msg) {
     }
 
     for (const [user, clientSet] of sockets.entries()) {
-      for (const client of clientSet) {
-        sendToSocket(client, msg);
-      }
+      for (const client of clientSet) sendToSocket(client, msg);
     }
     return;
   }
 
-  // 6. Presence & WebRTC
+  // PRESENCE / WEBRTC
   if (msg.type === 'presence_ping') {
     sendToSocket(senderSocket, { type: 'presence_pong', timestamp: Date.now() });
     return;
@@ -182,17 +167,19 @@ function handleMessage(senderSocket, msg) {
   if (msg.type === 'typing' || msg.type === 'webrtc') {
     const recipient = (msg.recipient || '').trim().toLowerCase();
     if (recipient && sockets.has(recipient)) {
-      for (const client of sockets.get(recipient)) {
-        sendToSocket(client, msg);
-      }
+      for (const client of sockets.get(recipient)) sendToSocket(client, msg);
     }
   }
 }
 
+// ============================================================================
+// SOCKET CLOSE CLEANUP
+// ============================================================================
 function handleSocketClose(socket) {
   if (socket.username && sockets.has(socket.username)) {
     const set = sockets.get(socket.username);
     set.delete(socket);
+
     if (set.size === 0) {
       sockets.delete(socket.username);
       if (users.has(socket.username)) {
@@ -203,45 +190,22 @@ function handleSocketClose(socket) {
   }
 }
 
+// ============================================================================
+// SEND TO SOCKET
+// ============================================================================
 function sendToSocket(socket, obj) {
   try {
     const str = JSON.stringify(obj);
-    if (socket.readyState === 1 || socket.readyState === WebSocket.OPEN) {
+    if (socket.readyState === WebSocket.OPEN) {
       socket.send(str);
-    } else if (socket.write) {
-      const frame = encodeFallbackFrame(str);
-      socket.write(frame);
     }
   } catch (e) {}
 }
 
-function encodeFallbackFrame(data) {
-  const payload = Buffer.from(data, 'utf8');
-  const length = payload.length;
-  let header;
-  if (length <= 125) {
-    header = Buffer.alloc(2);
-    header[0] = 0x81;
-    header[1] = length;
-  } else if (length <= 65535) {
-    header = Buffer.alloc(4);
-    header[0] = 0x81;
-    header[1] = 126;
-    header.writeUInt16BE(length, 2);
-  } else {
-    header = Buffer.alloc(10);
-    header[0] = 0x81;
-    header[1] = 127;
-    header.writeBigUInt64BE(BigInt(length), 2);
-  }
-  return Buffer.concat([header, payload]);
-}
-
-// ----------------------------------------------------------------------------
-// HTTP Server & REST Endpoints
-// ----------------------------------------------------------------------------
+// ============================================================================
+// HTTP SERVER
+// ============================================================================
 const server = http.createServer((req, res) => {
-  // CORS Headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-Identity');
@@ -255,72 +219,25 @@ const server = http.createServer((req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const pathname = parsedUrl.pathname;
 
-  // Web Client & PWA Single Page Dashboard
   if (pathname === '/' || pathname === '/index.html') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(getWebClientHTML());
     return;
   }
 
-  // Health Check
-  if (pathname === '/health' || pathname === '/api/health') {
+  if (pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'healthy',
-      app: 'Elmak Messenger (عِلمك)',
-      timestamp: new Date().toISOString(),
       connections: Array.from(sockets.keys()).length,
       users_online: Array.from(users.values()).filter(u => u.online).length,
     }));
     return;
   }
 
-  // Active Users Directory
-  if (pathname === '/api/users' && req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(Array.from(users.values())));
-    return;
-  }
-
-  // AI Translation Endpoint
-  if (pathname === '/api/ai/translate' && req.method === 'POST') {
-    let body = '';
-    req.on('data', (c) => body += c);
-    req.on('end', () => {
-      try {
-        const json = JSON.parse(body);
-        const text = json.text || '';
-        const lower = text.toLowerCase();
-
-        let dialect = "العربية الفصحى";
-        if (lower.includes('وش') || lower.includes('ابشر') || lower.includes('زين') || lower.includes('علمك')) {
-          dialect = "اللهجة الخليجية / السعودية";
-        } else if (lower.includes('ازيك') || lower.includes('عامل ايه') || lower.includes('كويس') || lower.includes('دلوقتي')) {
-          dialect = "اللهجة المصرية";
-        } else if (lower.includes('شو اخبارك') || lower.includes('بدي') || lower.includes('منيح')) {
-          dialect = "اللهجة الشامية";
-        } else if (lower.includes('واخا') || lower.includes('بزاف') || lower.includes('دابا')) {
-          dialect = "اللهجة المغاربية";
-        }
-
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({
-          original_text: text,
-          translated_text: text,
-          detected_dialect: dialect,
-          confidence: 0.99,
-        }));
-      } catch (e) {
-        res.writeHead(400);
-        res.end(JSON.stringify({ error: 'Invalid JSON' }));
-      }
-    });
-    return;
-  }
-
-  // Media Upload Endpoint
+  // MEDIA UPLOAD
   if (pathname === '/api/media/upload' && req.method === 'POST') {
-    const filename = `elmak_file_${Date.now()}_${Math.floor(Math.random() * 1000)}.bin`;
+    const filename = `elmak_${Date.now()}_${Math.floor(Math.random() * 1000)}.bin`;
     const filepath = path.join(UPLOADS_DIR, filename);
     const writeStream = fs.createWriteStream(filepath);
 
@@ -335,7 +252,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Media Download Endpoint
   if (pathname.startsWith('/api/media/')) {
     const filename = path.basename(pathname);
     const filepath = path.join(UPLOADS_DIR, filename);
@@ -350,12 +266,21 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-// Setup WebSocket Server using ws library
+// ============================================================================
+// WEBSOCKET SERVER WITH HEALTH MONITOR
+// ============================================================================
+function heartbeat() {
+  this.isAlive = true;
+}
+
 if (WebSocket && WebSocket.Server) {
   const wss = new WebSocket.Server({ server, path: '/ws' });
+
   wss.on('connection', (ws) => {
     ws.username = null;
     ws.isAlive = true;
+
+    ws.on('pong', heartbeat);
 
     ws.on('message', (data) => {
       try {
@@ -367,49 +292,25 @@ if (WebSocket && WebSocket.Server) {
     ws.on('close', () => handleSocketClose(ws));
     ws.on('error', () => handleSocketClose(ws));
   });
-  console.log('[Server] Attached official WebSocket.Server to /ws');
-} else {
-  // Native RFC6455 upgrade fallback
-  server.on('upgrade', (req, socket, head) => {
-    const key = req.headers['sec-websocket-key'];
-    if (!key) {
-      socket.destroy();
-      return;
-    }
-    const acceptKey = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
-    const headers = [
-      'HTTP/1.1 101 Switching Protocols',
-      'Upgrade: websocket',
-      'Connection: Upgrade',
-      `Sec-WebSocket-Accept: ${acceptKey}`,
-      '', '',
-    ];
-    socket.write(headers.join('\r\n'));
 
-    socket.on('data', (buffer) => {
-      try {
-        if (buffer.length < 2) return;
-        const isMasked = (buffer[1] & 0x80) !== 0;
-        let payloadLen = buffer[1] & 0x7f;
-        let offset = 2;
-        if (payloadLen === 126) { payloadLen = buffer.readUInt16BE(2); offset = 4; }
-        else if (payloadLen === 127) { payloadLen = Number(buffer.readBigUInt64BE(2)); offset = 10; }
-        let mask = null;
-        if (isMasked) { mask = buffer.slice(offset, offset + 4); offset += 4; }
-        const raw = buffer.slice(offset, offset + payloadLen);
-        if (isMasked && mask) {
-          for (let i = 0; i < raw.length; i++) raw[i] ^= mask[i % 4];
-        }
-        const msg = JSON.parse(raw.toString('utf8'));
-        handleMessage(socket, msg);
-      } catch (e) {}
+  setInterval(() => {
+    wss.clients.forEach((ws) => {
+      if (!ws.isAlive) {
+        console.log('[ELMAK WS] Dead socket removed:', ws.username);
+        handleSocketClose(ws);
+        return ws.terminate();
+      }
+      ws.isAlive = false;
+      ws.ping();
     });
+  }, 10000);
 
-    socket.on('close', () => handleSocketClose(socket));
-    socket.on('error', () => handleSocketClose(socket));
-  });
+  console.log('[Server] WebSocket health monitor enabled');
 }
 
+// ============================================================================
+// START SERVER
+// ============================================================================
 server.listen(PORT, HOST, () => {
   console.log('===============================================================');
   console.log(`  🚀 ELMAK (عِلمك) LIVE MESSAGING SERVER RUNNING`);
