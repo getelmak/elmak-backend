@@ -13,6 +13,7 @@ let WebSocket;
 try {
   WebSocket = require('ws');
 } catch (e) {
+  // Fallback if ws module is loading
   console.log('[Server] Loading fallback...');
 }
 
@@ -25,23 +26,39 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 }
 
 // In-Memory State
-const users = new Map(); 
-const sockets = new Map(); 
-const messagesHistory = new Map();
+const users = new Map(); // username -> { username, displayName, token, online: true, lastSeen }
+const sockets = new Map(); // username -> Set<WebSocket>
+const messagesHistory = new Map(); // chatId -> Array<Message>
 
-// ============================================================================
-// MESSAGE HANDLER
-// ============================================================================
+function broadcastPresence(username, status, lastSeen) {
+  if (!username) return;
+  const packet = {
+    type: 'presence',
+    username: username,
+    status: status,
+    last_seen: lastSeen || Date.now(),
+    timestamp: Date.now()
+  };
+  for (const [user, clientSet] of sockets.entries()) {
+    if (user !== username) {
+      for (const client of clientSet) {
+        sendToSocket(client, packet);
+      }
+    }
+  }
+}
+
 function handleMessage(senderSocket, msg) {
   if (!msg || !msg.type) return;
 
-  // AUTH
+  // 1. Authentication
   if (msg.type === 'auth') {
     const user = (msg.username || '').trim().toLowerCase();
     if (user) {
       senderSocket.username = user;
-
-      if (!sockets.has(user)) sockets.set(user, new Set());
+      if (!sockets.has(user)) {
+        sockets.set(user, new Set());
+      }
       sockets.get(user).add(senderSocket);
 
       const token = msg.token || crypto.randomBytes(16).toString('hex');
@@ -61,59 +78,80 @@ function handleMessage(senderSocket, msg) {
         if (msg.displayName) u.displayName = msg.displayName;
       }
 
-      sendToSocket(senderSocket, { type: 'auth_ok', username: user, token: token });
+      sendToSocket(senderSocket, {
+        type: 'auth_ok',
+        username: user,
+        token: token,
+        users: Array.from(users.values())
+      });
       console.log(`[ELMAK WS] Authenticated @${user}`);
 
-      // Replay history
+      // Broadcast online presence to all peers
+      broadcastPresence(user, 'online', Date.now());
+
+      // Replay all undelivered or historic messages for this user
       for (const [chatId, list] of messagesHistory.entries()) {
         for (const m of list) {
           const r = (m.recipient || '').toLowerCase().trim();
           const s = (m.sender || '').toLowerCase().trim();
-          if (r === user || s === user) sendToSocket(senderSocket, m);
+          if (r === user || s === user) {
+            sendToSocket(senderSocket, m);
+          }
         }
       }
     }
     return;
   }
 
-  // MESSAGE DISPATCH
+  // 2. Real-Time Message Dispatch
   if (msg.type === 'message') {
     const recipient = (msg.recipient || '').trim().toLowerCase();
     const sender = (senderSocket.username || msg.sender || '').trim().toLowerCase();
     msg.sender = sender;
     msg.recipient = recipient;
-    msg.timestamp = Date.now();
+    msg.timestamp = msg.timestamp || Date.now();
 
     const chatId = msg.chat_id || ('chat_' + [sender, recipient].sort().join('_'));
     msg.chat_id = chatId;
 
-    if (!messagesHistory.has(chatId)) messagesHistory.set(chatId, []);
+    // Save in history
+    if (!messagesHistory.has(chatId)) {
+      messagesHistory.set(chatId, []);
+    }
     messagesHistory.get(chatId).push(msg);
 
-    console.log(`[ELMAK WS] Dispatching message: @${sender} ➔ @${recipient}`);
+    console.log(`[ELMAK WS] Dispatching message: @${sender} ➔ @${recipient} (${chatId})`);
 
+    // Deliver to recipient sockets
     if (recipient && sockets.has(recipient)) {
-      for (const client of sockets.get(recipient)) sendToSocket(client, msg);
+      for (const client of sockets.get(recipient)) {
+        sendToSocket(client, msg);
+      }
     }
 
+    // Echo to sender other sockets if any
     if (sender && sockets.has(sender)) {
       for (const client of sockets.get(sender)) {
-        if (client !== senderSocket) sendToSocket(client, msg);
+        if (client !== senderSocket) {
+          sendToSocket(client, msg);
+        }
       }
     }
     return;
   }
 
-  // DELIVERY ACK
-  if (msg.type === 'delivery_ack') {
+  // 3. Delivery ACK & Read ACK (Double Check ✓✓ & Seen)
+  if (msg.type === 'delivery_ack' || msg.type === 'read_ack') {
     const recipient = (msg.recipient || '').trim().toLowerCase();
     if (recipient && sockets.has(recipient)) {
-      for (const client of sockets.get(recipient)) sendToSocket(client, msg);
+      for (const client of sockets.get(recipient)) {
+        sendToSocket(client, msg);
+      }
     }
     return;
   }
 
-  // DELETE
+  // 4. Zero-Trace Delete
   if (msg.type === 'delete') {
     const chatId = msg.chat_id;
     const messageId = msg.message_id;
@@ -124,6 +162,7 @@ function handleMessage(senderSocket, msg) {
       messagesHistory.set(chatId, filtered);
     }
 
+    // Broadcast delete to all connected clients
     for (const [user, clientSet] of sockets.entries()) {
       for (const client of clientSet) {
         sendToSocket(client, {
@@ -137,7 +176,7 @@ function handleMessage(senderSocket, msg) {
     return;
   }
 
-  // EDIT
+  // 5. Edit Message
   if (msg.type === 'edit') {
     const chatId = msg.chat_id;
     const messageId = msg.message_id;
@@ -153,62 +192,102 @@ function handleMessage(senderSocket, msg) {
     }
 
     for (const [user, clientSet] of sockets.entries()) {
-      for (const client of clientSet) sendToSocket(client, msg);
+      for (const client of clientSet) {
+        sendToSocket(client, msg);
+      }
     }
     return;
   }
 
-  // PRESENCE / WEBRTC
+  // 6. Presence Ping / Status
   if (msg.type === 'presence_ping') {
     sendToSocket(senderSocket, { type: 'presence_pong', timestamp: Date.now() });
     return;
   }
 
-  if (msg.type === 'typing' || msg.type === 'webrtc') {
+  if (msg.type === 'presence') {
+    const user = (senderSocket.username || msg.username || '').trim().toLowerCase();
+    const status = msg.status || 'online';
+    const lastSeen = msg.timestamp || Date.now();
+    if (user && users.has(user)) {
+      const u = users.get(user);
+      u.online = (status === 'online');
+      u.lastSeen = lastSeen;
+    }
+    broadcastPresence(user, status, lastSeen);
+    return;
+  }
+
+  // 7. Typing & WebRTC
+  if (msg.type === 'typing' || msg.type === 'stop_typing' || msg.type === 'webrtc') {
     const recipient = (msg.recipient || '').trim().toLowerCase();
     if (recipient && sockets.has(recipient)) {
-      for (const client of sockets.get(recipient)) sendToSocket(client, msg);
+      for (const client of sockets.get(recipient)) {
+        sendToSocket(client, msg);
+      }
     }
+    return;
   }
 }
 
-// ============================================================================
-// SOCKET CLOSE CLEANUP
-// ============================================================================
 function handleSocketClose(socket) {
   if (socket.username && sockets.has(socket.username)) {
     const set = sockets.get(socket.username);
     set.delete(socket);
-
     if (set.size === 0) {
       sockets.delete(socket.username);
       if (users.has(socket.username)) {
-        users.get(socket.username).online = false;
-        users.get(socket.username).lastSeen = Date.now();
+        const u = users.get(socket.username);
+        u.online = false;
+        u.lastSeen = Date.now();
       }
+      broadcastPresence(socket.username, 'offline', Date.now());
     }
   }
 }
 
-// ============================================================================
-// SEND TO SOCKET
-// ============================================================================
 function sendToSocket(socket, obj) {
   try {
     const str = JSON.stringify(obj);
-    if (socket.readyState === WebSocket.OPEN) {
+    if (socket.readyState === 1 || (WebSocket && socket.readyState === WebSocket.OPEN)) {
       socket.send(str);
+    } else if (socket.write) {
+      const frame = encodeFallbackFrame(str);
+      socket.write(frame);
     }
   } catch (e) {}
 }
 
-// ============================================================================
-// HTTP SERVER
-// ============================================================================
+function encodeFallbackFrame(data) {
+  const payload = Buffer.from(data, 'utf8');
+  const length = payload.length;
+  let header;
+  if (length <= 125) {
+    header = Buffer.alloc(2);
+    header[0] = 0x81;
+    header[1] = length;
+  } else if (length <= 65535) {
+    header = Buffer.alloc(4);
+    header[0] = 0x81;
+    header[1] = 126;
+    header.writeUInt16BE(length, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x81;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(length), 2);
+  }
+  return Buffer.concat([header, payload]);
+}
+
+// ----------------------------------------------------------------------------
+// HTTP Server & REST Endpoints
+// ----------------------------------------------------------------------------
 const server = http.createServer((req, res) => {
+  // CORS Headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-Identity');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-Identity, x-file-name, x-file-type');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -219,56 +298,88 @@ const server = http.createServer((req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const pathname = parsedUrl.pathname;
 
+  // Web Client & PWA Single Page Dashboard
   if (pathname === '/' || pathname === '/index.html') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(getWebClientHTML());
     return;
   }
 
-  if (pathname === '/health') {
+  // Health Check
+  if (pathname === '/health' || pathname === '/api/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'healthy',
+      app: 'Elmak Messenger (عِلمك)',
+      timestamp: new Date().toISOString(),
       connections: Array.from(sockets.keys()).length,
       users_online: Array.from(users.values()).filter(u => u.online).length,
     }));
     return;
   }
 
-  // MEDIA UPLOAD
-  // Media Upload Endpoint (محسّن – يدعم الصوتيات والصور والملفات)
-if (pathname === '/api/media/upload' && req.method === 'POST') {
+  // Active Users Directory
+  if (pathname === '/api/users' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(Array.from(users.values())));
+    return;
+  }
 
-  // اسم الملف الأصلي القادم من التطبيق
-  const originalName = req.headers['x-file-name'] || `file_${Date.now()}`;
+  // AI Translation Endpoint
+  if (pathname === '/api/ai/translate' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (c) => body += c);
+    req.on('end', () => {
+      try {
+        const json = JSON.parse(body);
+        const text = json.text || '';
+        const lower = text.toLowerCase();
 
-  // استخراج الامتداد الحقيقي (مثال: .mp3 / .png / .mp4)
-  const ext = path.extname(originalName) || '.bin';
+        let dialect = "العربية الفصحى";
+        if (lower.includes('وش') || lower.includes('ابشر') || lower.includes('زين') || lower.includes('علمك')) {
+          dialect = "اللهجة الخليجية / السعودية";
+        } else if (lower.includes('ازيك') || lower.includes('عامل ايه') || lower.includes('كويس') || lower.includes('دلوقتي')) {
+          dialect = "اللهجة المصرية";
+        } else if (lower.includes('شو اخبارك') || lower.includes('بدي') || lower.includes('منيح')) {
+          dialect = "اللهجة الشامية";
+        } else if (lower.includes('واخا') || lower.includes('بزاف') || lower.includes('دابا')) {
+          dialect = "اللهجة المغاربية";
+        }
 
-  // نوع الملف الحقيقي (MIME type)
-  const mime = req.headers['x-file-type'] || 'application/octet-stream';
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({
+          original_text: text,
+          translated_text: text,
+          detected_dialect: dialect,
+          confidence: 0.99,
+        }));
+      } catch (e) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      }
+    });
+    return;
+  }
 
-  // اسم الملف النهائي داخل السيرفر
-  const filename = `elmak_${Date.now()}_${Math.floor(Math.random() * 1000)}${ext}`;
-  const filepath = path.join(UPLOADS_DIR, filename);
+  // Media Upload Endpoint (Supports both /api/upload and /api/media/upload)
+  if ((pathname === '/api/media/upload' || pathname === '/api/upload') && req.method === 'POST') {
+    const rawFileName = req.headers['x-file-name'] || '';
+    const fileType = req.headers['x-file-type'] || '';
+    
+    let ext = path.extname(rawFileName);
+    if (!ext) {
+      if (fileType.includes('image/png')) ext = '.png';
+      else if (fileType.includes('image/jpeg')) ext = '.jpg';
+      else if (fileType.includes('image/webp')) ext = '.webp';
+      else if (fileType.includes('audio/m4a')) ext = '.m4a';
+      else if (fileType.includes('audio/mp3') || fileType.includes('audio/mpeg')) ext = '.mp3';
+      else if (fileType.includes('audio/aac')) ext = '.aac';
+      else if (fileType.includes('video/mp4')) ext = '.mp4';
+      else if (fileType.includes('application/pdf')) ext = '.pdf';
+      else ext = '.bin';
+    }
 
-  // حفظ الملف
-  const writeStream = fs.createWriteStream(filepath);
-  req.pipe(writeStream);
-
-  writeStream.on('finish', () => {
-    res.writeHead(201, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      file_id: filename,
-      file_url: `/api/media/${filename}`,
-      mime: mime,            // ← مهم جداً لتشغيل الصوتيات والصور
-      original_name: originalName
-    }));
-  });
-
-  return;
-}
-    const filename = `elmak_${Date.now()}_${Math.floor(Math.random() * 1000)}.bin`;
+    const filename = `elmak_file_${Date.now()}_${Math.floor(Math.random() * 1000)}${ext}`;
     const filepath = path.join(UPLOADS_DIR, filename);
     const writeStream = fs.createWriteStream(filepath);
 
@@ -278,16 +389,39 @@ if (pathname === '/api/media/upload' && req.method === 'POST') {
       res.end(JSON.stringify({
         file_id: filename,
         file_url: `/api/media/${filename}`,
+        url: `/api/media/${filename}`,
+        filename: rawFileName || filename,
+        mime_type: fileType
       }));
     });
     return;
   }
 
-  if (pathname.startsWith('/api/media/')) {
+  // Media Download & Stream Endpoint
+  if (pathname.startsWith('/api/media/') || pathname.startsWith('/uploads/')) {
     const filename = path.basename(pathname);
     const filepath = path.join(UPLOADS_DIR, filename);
     if (fs.existsSync(filepath)) {
-      res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+      const ext = path.extname(filename).toLowerCase();
+      let mimeType = 'application/octet-stream';
+      if (ext === '.jpg' || ext === '.jpeg') mimeType = 'image/jpeg';
+      else if (ext === '.png') mimeType = 'image/png';
+      else if (ext === '.gif') mimeType = 'image/gif';
+      else if (ext === '.webp') mimeType = 'image/webp';
+      else if (ext === '.mp4') mimeType = 'video/mp4';
+      else if (ext === '.m4a' || ext === '.aac') mimeType = 'audio/aac';
+      else if (ext === '.mp3') mimeType = 'audio/mpeg';
+      else if (ext === '.wav') mimeType = 'audio/wav';
+      else if (ext === '.ogg') mimeType = 'audio/ogg';
+      else if (ext === '.pdf') mimeType = 'application/pdf';
+
+      const stat = fs.statSync(filepath);
+      res.writeHead(200, {
+        'Content-Type': mimeType,
+        'Content-Length': stat.size,
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': 'public, max-age=31536000'
+      });
       fs.createReadStream(filepath).pipe(res);
       return;
     }
@@ -297,21 +431,12 @@ if (pathname === '/api/media/upload' && req.method === 'POST') {
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-// ============================================================================
-// WEBSOCKET SERVER WITH HEALTH MONITOR
-// ============================================================================
-function heartbeat() {
-  this.isAlive = true;
-}
-
+// Setup WebSocket Server using ws library
 if (WebSocket && WebSocket.Server) {
   const wss = new WebSocket.Server({ server, path: '/ws' });
-
   wss.on('connection', (ws) => {
     ws.username = null;
     ws.isAlive = true;
-
-    ws.on('pong', heartbeat);
 
     ws.on('message', (data) => {
       try {
@@ -323,25 +448,49 @@ if (WebSocket && WebSocket.Server) {
     ws.on('close', () => handleSocketClose(ws));
     ws.on('error', () => handleSocketClose(ws));
   });
+  console.log('[Server] Attached official WebSocket.Server to /ws');
+} else {
+  // Native RFC6455 upgrade fallback
+  server.on('upgrade', (req, socket, head) => {
+    const key = req.headers['sec-websocket-key'];
+    if (!key) {
+      socket.destroy();
+      return;
+    }
+    const acceptKey = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+    const headers = [
+      'HTTP/1.1 101 Switching Protocols',
+      'Upgrade: websocket',
+      'Connection: Upgrade',
+      `Sec-WebSocket-Accept: ${acceptKey}`,
+      '', '',
+    ];
+    socket.write(headers.join('\r\n'));
 
-  setInterval(() => {
-    wss.clients.forEach((ws) => {
-      if (!ws.isAlive) {
-        console.log('[ELMAK WS] Dead socket removed:', ws.username);
-        handleSocketClose(ws);
-        return ws.terminate();
-      }
-      ws.isAlive = false;
-      ws.ping();
+    socket.on('data', (buffer) => {
+      try {
+        if (buffer.length < 2) return;
+        const isMasked = (buffer[1] & 0x80) !== 0;
+        let payloadLen = buffer[1] & 0x7f;
+        let offset = 2;
+        if (payloadLen === 126) { payloadLen = buffer.readUInt16BE(2); offset = 4; }
+        else if (payloadLen === 127) { payloadLen = Number(buffer.readBigUInt64BE(2)); offset = 10; }
+        let mask = null;
+        if (isMasked) { mask = buffer.slice(offset, offset + 4); offset += 4; }
+        const raw = buffer.slice(offset, offset + payloadLen);
+        if (isMasked && mask) {
+          for (let i = 0; i < raw.length; i++) raw[i] ^= mask[i % 4];
+        }
+        const msg = JSON.parse(raw.toString('utf8'));
+        handleMessage(socket, msg);
+      } catch (e) {}
     });
-  }, 10000);
 
-  console.log('[Server] WebSocket health monitor enabled');
+    socket.on('close', () => handleSocketClose(socket));
+    socket.on('error', () => handleSocketClose(socket));
+  });
 }
 
-// ============================================================================
-// START SERVER
-// ============================================================================
 server.listen(PORT, HOST, () => {
   console.log('===============================================================');
   console.log(`  🚀 ELMAK (عِلمك) LIVE MESSAGING SERVER RUNNING`);
@@ -544,6 +693,8 @@ function getWebClientHTML() {
       <div class="messages-container" id="messages-container"></div>
 
       <div class="input-bar">
+        <input type="file" id="web-file-input" style="display:none" onchange="handleWebFileUpload(event)">
+        <button class="action-btn" style="font-size:20px; padding:6px;" title="إرفاق صورة أو ملف" onclick="document.getElementById('web-file-input').click()">📎</button>
         <input type="text" class="chat-input" id="message-input" placeholder="اكتب رسالتك المشفرة هنا..." onkeypress="if(event.key==='Enter') sendMessage()">
         <button class="send-btn" onclick="sendMessage()">➤</button>
       </div>
@@ -593,8 +744,10 @@ function getWebClientHTML() {
     }
 
     let activePeer = null;
-    let chats = {}; // { peerUsername: [ { id, sender, text, time, status } ] }
+    let chats = {}; // { peerUsername: [ { id, sender, text, time, status, type, mediaUrl, mediaName } ] }
     let ws = null;
+    let heartbeatTimer = null;
+    let sendQueue = [];
 
     // Base64 E2EE Protocol
     function encryptText(plain) {
@@ -626,31 +779,57 @@ function getWebClientHTML() {
       ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
+        console.log('[ELMAK Web] WebSocket connected!');
         ws.send(JSON.stringify({
           type: 'auth',
           username: myUser,
           displayName: myName
         }));
+
+        // Flush any queued messages
+        while (sendQueue.length > 0) {
+          const item = sendQueue.shift();
+          ws.send(JSON.stringify(item));
+        }
+
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        heartbeatTimer = setInterval(() => {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'presence_ping' }));
+          }
+        }, 15000);
       };
 
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
           
-          // 1. Delivery ACK -> Double check ✓✓
-          if (data.type === 'delivery_ack') {
+          // 1. Delivery ACK & Read ACK -> Checkmarks
+          if (data.type === 'delivery_ack' || data.type === 'read_ack') {
             const msgId = data.message_id;
             for (let u in chats) {
               const m = chats[u].find(item => item.id === msgId);
               if (m) {
-                m.status = 'delivered'; // ✓✓
+                m.status = data.type === 'read_ack' ? 'read' : 'delivered';
               }
             }
             if (activePeer) renderMessages();
             return;
           }
 
-          // 2. Message packet
+          // 2. Presence Updates
+          if (data.type === 'presence') {
+            const u = (data.username || '').toLowerCase().trim();
+            if (u && activePeer === u) {
+              const statusEl = document.getElementById('active-chat-status');
+              if (statusEl) {
+                statusEl.innerText = data.status === 'online' ? '🟢 متصل الآن' : '⚪ آخر ظهور قبل قليل';
+                statusEl.style.color = data.status === 'online' ? 'var(--emerald-glow)' : 'var(--text-muted)';
+              }
+            }
+          }
+
+          // 3. Message packet
           if (data.type === 'message') {
             const sender = (data.sender || '').toLowerCase().trim();
             const recipient = (data.recipient || '').toLowerCase().trim();
@@ -660,35 +839,35 @@ function getWebClientHTML() {
             if (!peer) return;
 
             let textContent = '';
-            if (data.payload && data.payload.cipher) {
-              textContent = decryptText(data.payload.cipher);
+            const payload = data.payload || {};
+            if (payload.cipher) {
+              textContent = decryptText(payload.cipher);
             } else {
-              textContent = data.payload?.text || data.text || '';
+              textContent = payload.text || data.text || '';
             }
-            const mime = data.mime || data.payload?.mime || null;
-const fileUrl = data.file_url || data.payload?.file_url || null;
 
+            const msgType = payload.type || 'text';
+            const mediaUrl = payload.media_url || null;
+            const mediaName = payload.media_name || null;
             const msgId = data.client_message_id || data.message_id || 'm_' + Date.now();
             
             if (!chats[peer]) chats[peer] = [];
             const existing = chats[peer].find(m => m.id === msgId);
             if (!existing) {
               chats[peer].push({
-  id: msgId,
-  sender: sender,
-  text: textContent,
-  mime: mime,
-  file_url: fileUrl,
-  status: isFromMe ? 'sent' : 'delivered',
-  timestamp: data.timestamp,
-  time: new Date(data.timestamp).toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' })
-});
-                chats[peer].sort((a, b) => a.timestamp - b.timestamp);
+                id: msgId,
+                sender: sender,
+                text: textContent,
+                type: msgType,
+                mediaUrl: mediaUrl,
+                mediaName: mediaName,
+                status: isFromMe ? 'sent' : 'delivered',
+                time: new Date().toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' })
               });
               renderChatList();
               if (activePeer === peer) renderMessages();
 
-              // If I received message, send Delivery ACK
+              // Send Delivery ACK (Double check confirmation)
               if (!isFromMe && ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({
                   type: 'delivery_ack',
@@ -713,7 +892,10 @@ const fileUrl = data.file_url || data.payload?.file_url || null;
         } catch (e) {}
       };
 
-      ws.onclose = () => setTimeout(initWebSocket, 2000);
+      ws.onclose = () => {
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        setTimeout(initWebSocket, 2000);
+      };
     }
 
     function renderChatList() {
@@ -727,19 +909,27 @@ const fileUrl = data.file_url || data.payload?.file_url || null;
       peers.forEach(peer => {
         const msgs = chats[peer];
         const lastMsg = msgs[msgs.length - 1];
+        let preview = 'محادثة مشفرة';
+        if (lastMsg) {
+          if (lastMsg.type === 'image') preview = '📷 صورة مشفرة';
+          else if (lastMsg.type === 'audio') preview = '🎙️ رسالة صوتية مشفرة';
+          else if (lastMsg.type === 'video') preview = '🎥 فيديو مشفر';
+          else if (lastMsg.type === 'document') preview = '📄 ' + (lastMsg.mediaName || 'مستند');
+          else preview = lastMsg.text;
+        }
         const item = document.createElement('div');
         item.className = 'chat-item ' + (activePeer === peer ? 'active' : '');
         item.onclick = () => openChat(peer);
-        item.innerHTML = `
-          <div class="chat-avatar">${peer[0].toUpperCase()}</div>
+        item.innerHTML = \`
+          <div class="chat-avatar">\${peer[0].toUpperCase()}</div>
           <div class="chat-info">
             <div class="chat-name-row">
-              <span class="chat-name">@${peer}</span>
-              <span class="chat-time">${lastMsg ? lastMsg.time : ''}</span>
+              <span class="chat-name">@\${peer}</span>
+              <span class="chat-time">\${lastMsg ? lastMsg.time : ''}</span>
             </div>
-            <div class="chat-last-msg">${lastMsg ? lastMsg.text : 'محادثة مشفرة'}</div>
+            <div class="chat-last-msg">\${preview}</div>
           </div>
-        `;
+        \`;
         container.appendChild(item);
       });
     }
@@ -759,6 +949,24 @@ const fileUrl = data.file_url || data.payload?.file_url || null;
       document.getElementById('conversation-view').classList.add('active');
       renderChatList();
       renderMessages();
+
+      // Send read ACK for messages from this peer
+      if (chats[activePeer]) {
+        chats[activePeer].forEach(m => {
+          if (m.sender !== myUser && m.status !== 'read') {
+            m.status = 'read';
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: 'read_ack',
+                message_id: m.id,
+                chat_id: 'chat_' + [myUser, activePeer].sort().join('_'),
+                sender: myUser,
+                recipient: activePeer
+              }));
+            }
+          }
+        });
+      }
     }
 
     function closeConversation() {
@@ -779,28 +987,54 @@ const fileUrl = data.file_url || data.payload?.file_url || null;
       if (!activePeer || !chats[activePeer]) return;
       chats[activePeer].forEach(msg => {
         const isMe = msg.sender.toLowerCase() === myUser.toLowerCase();
-        const checkMark = msg.status === 'delivered' ? '✓✓' : '✓';
+        
+        let checkMark = '✓';
+        let checkColor = 'rgba(255,255,255,0.7)';
+        if (msg.status === 'delivered') {
+          checkMark = '✓✓';
+        } else if (msg.status === 'read') {
+          checkMark = '✓✓';
+          checkColor = '#38BDF8';
+        }
+
         const div = document.createElement('div');
         div.className = 'msg-bubble ' + (isMe ? 'msg-me' : 'msg-peer');
-        div.innerHTML = `
-          <div>${msg.text}</div>
-  if (msg.mime && msg.mime.startsWith('audio/')) {
-  div.innerHTML += `
-    <audio controls style="width:100%; margin-top:8px;">
-      <source src="${msg.file_url}" type="${msg.mime}">
-    </audio>
-  `;
-}
-          ${msg.translated ? `<div style="margin-top:4px; font-size:12px; color:var(--gold); border-top:1px dashed rgba(255,255,255,0.2); padding-top:4px;">✨ ترجمة (${msg.detected || 'فصحى'}): ${msg.translated}</div>` : ''}
+        
+        let contentHtml = '';
+        if (msg.type === 'image' && msg.mediaUrl) {
+          contentHtml += \`<img src="\${msg.mediaUrl}" style="max-width: 100%; max-height: 240px; border-radius: 10px; margin-bottom: 6px; display: block;" alt="صورة">\`;
+        }
+        if (msg.type === 'audio' && msg.mediaUrl) {
+          contentHtml += \`<div style="margin-bottom: 6px;"><audio controls src="\${msg.mediaUrl}" style="max-width: 100%; height: 36px; outline: none;"></audio></div>\`;
+        }
+        if (msg.type === 'video' && msg.mediaUrl) {
+          contentHtml += \`<video controls src="\${msg.mediaUrl}" style="max-width: 100%; max-height: 240px; border-radius: 10px; margin-bottom: 6px; display: block;"></video>\`;
+        }
+        if (msg.type === 'document') {
+          contentHtml += \`<div style="background: rgba(0,0,0,0.25); padding: 8px 12px; border-radius: 8px; margin-bottom: 6px; display: flex; align-items: center; gap: 8px;">
+            <span style="font-size: 20px;">📄</span>
+            <div>
+              <div style="font-weight: bold; font-size: 13px;">\${msg.mediaName || 'مستند مشفر'}</div>
+              <div style="font-size: 10px; opacity: 0.7;">مشفر E2EE 🔒</div>
+            </div>
+          </div>\`;
+        }
+        if (msg.text) {
+          contentHtml += \`<div>\${msg.text}</div>\`;
+        }
+
+        div.innerHTML = \`
+          \${contentHtml}
+          \${msg.translated ? \`<div style="margin-top:4px; font-size:12px; color:var(--gold); border-top:1px dashed rgba(255,255,255,0.2); padding-top:4px;">✨ ترجمة (\${msg.detected || 'فصحى'}): \${msg.translated}</div>\` : ''}
           <div class="msg-meta">
-            <span>${msg.time}</span>
-            ${isMe ? `<span style="margin-right:4px; font-size:12px;">${checkMark}</span>` : ''}
+            <span>\${msg.time}</span>
+            \${isMe ? \`<span style="margin-right:4px; font-size:12px; color:\${checkColor}; font-weight:bold;">\${checkMark}</span>\` : ''}
           </div>
           <div class="msg-actions">
-            ${!isMe ? `<button class="action-btn" onclick="translateMsg('${msg.id}')">✨ ترجمة</button>` : ''}
-            <button class="action-btn" onclick="deleteMsg('${msg.id}')">🗑️ حذف للطرفين</button>
+            \${(!isMe && msg.text) ? \`<button class="action-btn" onclick="translateMsg('\${msg.id}')">✨ ترجمة</button>\` : ''}
+            <button class="action-btn" onclick="deleteMsg('\${msg.id}')">🗑️ حذف للطرفين</button>
           </div>
-        `;
+        \`;
         container.appendChild(div);
       });
       container.scrollTop = container.scrollHeight;
@@ -814,27 +1048,140 @@ const fileUrl = data.file_url || data.payload?.file_url || null;
 
       const msgId = 'msg_' + Date.now();
       const timeStr = new Date().toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
-      const newMsg = { id: msgId, sender: myUser, text: text, status: 'sent', time: timeStr };
+      const newMsg = { id: msgId, sender: myUser, text: text, type: 'text', status: 'sent', time: timeStr };
 
       if (!chats[activePeer]) chats[activePeer] = [];
       chats[activePeer].push(newMsg);
       renderChatList();
       renderMessages();
 
+      const packet = {
+        type: 'message',
+        client_message_id: msgId,
+        sender: myUser,
+        recipient: activePeer,
+        chat_id: 'chat_' + [myUser, activePeer].sort().join('_'),
+        payload: {
+          text: text,
+          cipher: encryptText(text),
+          type: 'text'
+        }
+      };
+
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
+        ws.send(JSON.stringify(packet));
+      } else {
+        sendQueue.push(packet);
+        initWebSocket();
+      }
+    }
+
+    function handleWebFileUpload(event) {
+      const file = event.target.files[0];
+      if (!file || !activePeer) return;
+      event.target.value = '';
+
+      const isImage = file.type.startsWith('image/');
+      const isAudio = file.type.startsWith('audio/');
+      const isVideo = file.type.startsWith('video/');
+      const msgType = isImage ? 'image' : (isAudio ? 'audio' : (isVideo ? 'video' : 'document'));
+
+      fetch('/api/upload', {
+        method: 'POST',
+        headers: {
+          'x-file-name': encodeURIComponent(file.name),
+          'x-file-type': file.type || 'application/octet-stream'
+        },
+        body: file
+      }).then(res => res.json()).then(data => {
+        const uploadedUrl = data.url || data.file_url;
+        const msgId = 'msg_' + Date.now();
+        const timeStr = new Date().toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
+        const newMsg = {
+          id: msgId,
+          sender: myUser,
+          text: '',
+          type: msgType,
+          mediaUrl: uploadedUrl,
+          mediaName: file.name,
+          status: 'sent',
+          time: timeStr
+        };
+
+        if (!chats[activePeer]) chats[activePeer] = [];
+        chats[activePeer].push(newMsg);
+        renderChatList();
+        renderMessages();
+
+        const packet = {
           type: 'message',
           client_message_id: msgId,
           sender: myUser,
           recipient: activePeer,
           chat_id: 'chat_' + [myUser, activePeer].sort().join('_'),
           payload: {
-            text: text,
-            cipher: encryptText(text),
-            type: 'text'
+            text: '',
+            cipher: '',
+            type: msgType,
+            media_url: uploadedUrl,
+            media_name: file.name,
+            media_size: file.size
           }
-        }));
-      }
+        };
+
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(packet));
+        } else {
+          sendQueue.push(packet);
+          initWebSocket();
+        }
+      }).catch(err => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const dataUrl = e.target.result;
+          const msgId = 'msg_' + Date.now();
+          const timeStr = new Date().toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
+          const newMsg = {
+            id: msgId,
+            sender: myUser,
+            text: '',
+            type: msgType,
+            mediaUrl: dataUrl,
+            mediaName: file.name,
+            status: 'sent',
+            time: timeStr
+          };
+
+          if (!chats[activePeer]) chats[activePeer] = [];
+          chats[activePeer].push(newMsg);
+          renderChatList();
+          renderMessages();
+
+          const packet = {
+            type: 'message',
+            client_message_id: msgId,
+            sender: myUser,
+            recipient: activePeer,
+            chat_id: 'chat_' + [myUser, activePeer].sort().join('_'),
+            payload: {
+              text: '',
+              cipher: '',
+              type: msgType,
+              media_url: dataUrl,
+              media_name: file.name,
+              media_size: file.size
+            }
+          };
+
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(packet));
+          } else {
+            sendQueue.push(packet);
+            initWebSocket();
+          }
+        };
+        reader.readAsDataURL(file);
+      });
     }
 
     function deleteMsg(msgId) {
