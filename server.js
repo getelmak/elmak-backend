@@ -18,7 +18,7 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 }
 
 // In-Memory State
-const users = new Map(); // username -> { username, displayName, token, online: true, lastSeen }
+const users = new Map(); // username -> { username, displayName, identityKey, online: true, lastSeen }
 const sockets = new Map(); // username -> Set<WebSocketWrapper>
 const messagesHistory = new Map(); // chatId -> Array<Message>
 const preKeysStore = new Map(); // username -> bundle
@@ -61,49 +61,41 @@ class MiniWS {
     let offset = 2;
 
     if (payloadLength === 126) {
-      if (buffer.length < 4) return;
       payloadLength = buffer.readUInt16BE(2);
       offset = 4;
     } else if (payloadLength === 127) {
-      if (buffer.length < 10) return;
       payloadLength = Number(buffer.readBigUInt64BE(2));
       offset = 10;
     }
 
-    let maskingKey = null;
+    let mask = null;
     if (isMasked) {
-      if (buffer.length < offset + 4) return;
-      maskingKey = buffer.slice(offset, offset + 4);
+      mask = buffer.slice(offset, offset + 4);
       offset += 4;
     }
 
-    if (buffer.length < offset + payloadLength) return;
-    const rawPayload = buffer.slice(offset, offset + payloadLength);
-
-    if (isMasked && maskingKey) {
-      for (let i = 0; i < rawPayload.length; i++) {
-        rawPayload[i] ^= maskingKey[i % 4];
+    const data = buffer.slice(offset, offset + payloadLength);
+    if (mask) {
+      for (let i = 0; i < data.length; i++) {
+        data[i] ^= mask[i % 4];
       }
     }
 
     try {
-      const msgStr = rawPayload.toString('utf8');
-      const msg = JSON.parse(msgStr);
+      const msg = JSON.parse(data.toString('utf8'));
       this.onMessage(msg);
     } catch (e) {
-      // Ignored malformed frames
+      // Ignore malformed frames
     }
   }
 
-  encodeFrame(data) {
-    const payload = Buffer.from(data, 'utf8');
+  encodeFrame(payloadText) {
+    const payload = Buffer.from(payloadText, 'utf8');
     const length = payload.length;
     let header;
 
-    if (length <= 125) {
-      header = Buffer.alloc(2);
-      header[0] = 0x81; // FIN + text opcode
-      header[1] = length;
+    if (length < 126) {
+      header = Buffer.from([0x81, length]);
     } else if (length <= 65535) {
       header = Buffer.alloc(4);
       header[0] = 0x81;
@@ -293,10 +285,10 @@ const server = http.createServer((req, res) => {
   // CORS Headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-Identity');
+  res.setHeader('Access-Control-Allow-Headers', '*');
 
   if (req.method === 'OPTIONS') {
-    res.writeHead(204);
+    res.writeHead(200);
     res.end();
     return;
   }
@@ -304,29 +296,29 @@ const server = http.createServer((req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const pathname = parsedUrl.pathname;
 
-  // Web Client & PWA Single Page Dashboard
-  if (pathname === '/' || pathname === '/index.html') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(getWebClientHTML());
-    return;
-  }
-
   // Health Check
-  if (pathname === '/health' || pathname === '/api/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+  if (pathname === '/api/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({
-      status: 'healthy',
-      app: 'Elmak Messenger (عِلمك)',
-      timestamp: new Date().toISOString(),
-      connections: Array.from(sockets.keys()).length,
-      users_online: Array.from(users.values()).filter(u => u.online).length,
+      status: 'operational',
+      server: 'Elmak Real-Time Node Server',
+      version: '1.2.0',
+      connected_users: sockets.size,
+      uptime_sec: Math.floor(process.uptime()),
     }));
     return;
   }
 
-  // Active Users Directory
+  // If root or index requested, render the Full Elmak Web & iOS PWA Interface
+  if (pathname === '/' || pathname === '/index.html') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(getEmbeddedAppHTML());
+    return;
+  }
+
+  // Active Users List
   if (pathname === '/api/users' && req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify(Array.from(users.values())));
     return;
   }
@@ -434,117 +426,137 @@ server.listen(PORT, HOST, () => {
 });
 
 // ----------------------------------------------------------------------------
-// Built-in Responsive Web Client / iPhone PWA UI
+// Embedded iOS PWA & Ultra-Fast Web Client (Arabesque Cyber Theme)
 // ----------------------------------------------------------------------------
-function getWebClientHTML() {
+function getEmbeddedAppHTML() {
   return `<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>عِلمك - تطبيق المراسلة الفورية المشفرة</title>
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="عِلمك">
+  <title>عِلمك - المراسلة الفورية المشفرة 24/7</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg: #090D16;
-      --surface: #111726;
-      --surface-light: #1A2238;
-      --primary: #0EA5E9;
-      --accent: #38BDF8;
+      --bg: #0A0F1D;
+      --surface: #111927;
+      --surface-light: #1E293B;
+      --primary: #0F5132;
+      --primary-light: #198754;
       --emerald-glow: #10B981;
-      --gold: #F59E0B;
-      --text-main: #F8FAFC;
+      --gold: #D4AF37;
+      --text: #F8FAFC;
       --text-muted: #94A3B8;
+      --bubble-me: #064E3B;
+      --bubble-peer: #1E293B;
       --border: rgba(255, 255, 255, 0.08);
-      --font: 'Cairo', system-ui, -apple-system, sans-serif;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: var(--font); }
-    body { background-color: var(--bg); color: var(--text-main); height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Tajawal', sans-serif; -webkit-tap-highlight-color: transparent; }
+    body { background-color: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
     
     /* Header */
     .app-header {
-      background: var(--surface); border-bottom: 1px solid var(--border);
-      padding: 12px 20px; display: flex; align-items: center; justify-content: space-between;
-      height: 64px; flex-shrink: 0;
+      background: rgba(17, 25, 39, 0.95);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      z-index: 100;
     }
-    .brand-section { display: flex; align-items: center; gap: 12px; }
+    .brand-section { display: flex; align-items: center; gap: 10px; }
     .brand-logo {
-      width: 40px; height: 40px; border-radius: 12px; background: linear-gradient(135deg, var(--primary), #0284C7);
-      display: flex; align-items: center; justify-content: center; font-size: 22px; font-weight: 900;
-      box-shadow: 0 4px 14px rgba(14, 165, 233, 0.35); color: #FFF;
+      width: 40px; height: 40px; border-radius: 12px;
+      background: linear-gradient(135deg, #0F5132, #10B981);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 22px; font-weight: 800; color: #FFF;
+      box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);
+      border: 1px solid rgba(212, 175, 55, 0.4);
     }
-    .brand-title { font-size: 18px; font-weight: 800; }
-    .brand-subtitle { font-size: 11px; color: var(--emerald-glow); font-weight: 600; display: flex; align-items: center; gap: 4px; }
-    .status-dot { width: 7px; height: 7px; background: var(--emerald-glow); border-radius: 50%; display: inline-block; animation: pulse 2s infinite; }
-    @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
-
-    .account-badge {
-      background: var(--surface-light); border: 1px solid var(--border); border-radius: 20px;
-      padding: 6px 14px; font-size: 13px; font-weight: 600; cursor: pointer; transition: 0.2s;
-    }
-    .account-badge:hover { border-color: var(--primary); }
-
-    /* Main Layout */
-    .main-container { display: flex; flex: 1; height: calc(100vh - 64px); overflow: hidden; position: relative; }
+    .brand-title { font-size: 19px; font-weight: 800; letter-spacing: -0.5px; }
+    .brand-subtitle { font-size: 11px; color: var(--gold); display: flex; align-items: center; gap: 4px; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #10B981; box-shadow: 0 0 8px #10B981; }
     
-    /* Sidebar */
+    .account-badge {
+      background: var(--surface-light);
+      border: 1px solid var(--border);
+      padding: 6px 12px;
+      border-radius: 20px;
+      font-size: 13px;
+      color: var(--text);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    /* Main Container */
+    .main-container { flex: 1; display: flex; overflow: hidden; position: relative; }
+    
+    /* Sidebar / Chat List */
     .chat-sidebar {
-      width: 100%; max-width: 340px; background: var(--surface); border-left: 1px solid var(--border);
-      display: flex; flex-direction: column; flex-shrink: 0;
+      width: 100%;
+      max-width: 380px;
+      background: var(--surface);
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      height: 100%;
     }
     .search-box { padding: 12px; border-bottom: 1px solid var(--border); }
     .search-input {
-      width: 100%; padding: 10px 14px; background: var(--surface-light); border: 1px solid var(--border);
-      border-radius: 10px; color: #FFF; font-size: 13px; outline: none; transition: 0.2s;
+      width: 100%; padding: 10px 14px; background: var(--surface-light);
+      border: 1px solid var(--border); border-radius: 12px; color: #FFF; font-size: 14px; outline: none;
     }
-    .search-input:focus { border-color: var(--primary); }
-    
     .chat-list { flex: 1; overflow-y: auto; }
     .chat-item {
-      padding: 12px 16px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid rgba(255,255,255,0.03);
-      cursor: pointer; transition: 0.2s;
+      padding: 14px 16px; border-bottom: 1px solid rgba(255,255,255,0.03);
+      display: flex; align-items: center; gap: 12px; cursor: pointer; transition: 0.2s;
     }
-    .chat-item:hover, .chat-item.active { background: var(--surface-light); }
+    .chat-item:hover, .chat-item.active { background: rgba(16, 185, 129, 0.08); border-right: 3px solid var(--emerald-glow); }
     .chat-avatar {
-      width: 44px; height: 44px; border-radius: 50%; background: linear-gradient(135deg, #1E293B, #334155);
-      display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700;
-      color: var(--primary); border: 1px solid var(--border); flex-shrink: 0;
+      width: 46px; height: 46px; border-radius: 50%; background: linear-gradient(135deg, #1E293B, #334155);
+      display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700; color: var(--gold);
+      position: relative;
     }
     .chat-info { flex: 1; min-width: 0; }
-    .chat-name-row { display: flex; justify-content: space-between; margin-bottom: 2px; }
-    .chat-name { font-weight: 700; font-size: 14px; }
+    .chat-name-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
+    .chat-name { font-weight: 700; font-size: 15px; }
     .chat-time { font-size: 11px; color: var(--text-muted); }
-    .chat-last-msg { font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .chat-last-msg { font-size: 13px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-    /* Conversation View */
-    .conversation-view { flex: 1; display: flex; flex-direction: column; background: var(--bg); }
+    /* Conversation Area */
+    .conversation-view {
+      flex: 1; display: flex; flex-direction: column; background: var(--bg); height: 100%; position: relative;
+    }
     .conversation-header {
-      padding: 12px 20px; background: var(--surface); border-bottom: 1px solid var(--border);
+      padding: 12px 16px; background: var(--surface); border-bottom: 1px solid var(--border);
       display: flex; align-items: center; justify-content: space-between;
     }
-    .messages-container { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
-    
+    .messages-container {
+      flex: 1; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;
+    }
     .msg-bubble {
-      max-width: 75%; padding: 10px 14px; border-radius: 16px; font-size: 14px; line-height: 1.5;
-      position: relative; word-break: break-word;
+      max-width: 75%; padding: 10px 14px; border-radius: 16px; font-size: 14.5px; line-height: 1.5;
+      position: relative; word-break: break-word; animation: fadeIn 0.2s ease;
     }
-    .msg-me {
-      align-self: flex-start; background: linear-gradient(135deg, #0284C7, #0369A1); color: #FFF;
-      border-bottom-right-radius: 4px; box-shadow: 0 4px 12px rgba(2, 132, 199, 0.2);
-    }
-    .msg-peer {
-      align-self: flex-end; background: var(--surface-light); color: var(--text-main);
-      border-bottom-left-radius: 4px; border: 1px solid var(--border);
-    }
-    .msg-meta { display: flex; align-items: center; justify-content: flex-end; gap: 4px; font-size: 10px; opacity: 0.75; margin-top: 4px; }
-    .msg-actions { margin-top: 6px; padding-top: 4px; border-top: 1px solid rgba(255,255,255,0.1); display: flex; gap: 8px; font-size: 11px; }
-    .action-btn { background: none; border: none; color: #FFF; opacity: 0.8; cursor: pointer; padding: 2px 6px; border-radius: 4px; }
-    .action-btn:hover { opacity: 1; background: rgba(255,255,255,0.1); }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+    .msg-me { align-self: flex-start; background: var(--bubble-me); color: #FFF; border-bottom-right-radius: 4px; border: 1px solid rgba(16, 185, 129, 0.2); }
+    .msg-peer { align-self: flex-end; background: var(--bubble-peer); color: #FFF; border-bottom-left-radius: 4px; border: 1px solid var(--border); }
+    .msg-meta { font-size: 10px; color: rgba(255,255,255,0.6); display: flex; justify-content: flex-end; align-items: center; gap: 4px; margin-top: 4px; }
+    .msg-actions { display: flex; gap: 6px; margin-top: 6px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 4px; }
+    .action-btn { font-size: 11px; background: rgba(0,0,0,0.3); border: none; color: #E2E8F0; padding: 2px 8px; border-radius: 8px; cursor: pointer; }
+    .action-btn:hover { background: rgba(0,0,0,0.5); color: #FFF; }
 
+    /* Input Bar */
     .input-bar {
-      padding: 14px 20px; background: var(--surface); border-top: 1px solid var(--border);
+      padding: 12px 16px; background: var(--surface); border-top: 1px solid var(--border);
       display: flex; align-items: center; gap: 10px;
     }
     .chat-input {
@@ -806,16 +818,16 @@ function getWebClientHTML() {
         const item = document.createElement('div');
         item.className = 'chat-item ' + (activePeer === peer ? 'active' : '');
         item.onclick = () => openChat(peer);
-        item.innerHTML = `
-          <div class="chat-avatar">${peer[0].toUpperCase()}</div>
+        item.innerHTML = \`
+          <div class="chat-avatar">\${peer[0].toUpperCase()}</div>
           <div class="chat-info">
             <div class="chat-name-row">
-              <span class="chat-name">@${peer}</span>
-              <span class="chat-time">${lastMsg ? lastMsg.time : ''}</span>
+              <span class="chat-name">@\${peer}</span>
+              <span class="chat-time">\${lastMsg ? lastMsg.time : ''}</span>
             </div>
-            <div class="chat-last-msg">${lastMsg ? lastMsg.text : 'محادثة مشفرة'}</div>
+            <div class="chat-last-msg">\${lastMsg ? lastMsg.text : 'محادثة مشفرة'}</div>
           </div>
-        `;
+        \`;
         container.appendChild(item);
       });
     }
@@ -858,18 +870,18 @@ function getWebClientHTML() {
         const checkMark = msg.status === 'delivered' ? '✓✓' : '✓';
         const div = document.createElement('div');
         div.className = 'msg-bubble ' + (isMe ? 'msg-me' : 'msg-peer');
-        div.innerHTML = `
-          <div>${msg.text}</div>
-          ${msg.translated ? `<div style="margin-top:4px; font-size:12px; color:var(--gold); border-top:1px dashed rgba(255,255,255,0.2); padding-top:4px;">✨ ترجمة (${msg.detected || 'فصحى'}): ${msg.translated}</div>` : ''}
+        div.innerHTML = \`
+          <div>\${msg.text}</div>
+          \${msg.translated ? \`<div style="margin-top:4px; font-size:12px; color:var(--gold); border-top:1px dashed rgba(255,255,255,0.2); padding-top:4px;">✨ ترجمة (\${msg.detected || 'فصحى'}): \${msg.translated}</div>\` : ''}
           <div class="msg-meta">
-            <span>${msg.time}</span>
-            ${isMe ? `<span style="margin-right:4px; font-size:12px;">${checkMark}</span>` : ''}
+            <span>\${msg.time}</span>
+            \${isMe ? \`<span style="margin-right:4px; font-size:12px;">\${checkMark}</span>\` : ''}
           </div>
           <div class="msg-actions">
-            ${!isMe ? `<button class="action-btn" onclick="translateMsg('${msg.id}')">✨ ترجمة</button>` : ''}
-            <button class="action-btn" onclick="deleteMsg('${msg.id}')">🗑️ حذف للطرفين</button>
+            \${!isMe ? \`<button class="action-btn" onclick="translateMsg('\${msg.id}')">✨ ترجمة</button>\` : ''}
+            <button class="action-btn" onclick="deleteMsg('\${msg.id}')">🗑️ حذف للطرفين</button>
           </div>
-        `;
+        \`;
         container.appendChild(div);
       });
       container.scrollTop = container.scrollHeight;
@@ -954,3 +966,4 @@ function getWebClientHTML() {
 </body>
 </html>`;
 }
+
