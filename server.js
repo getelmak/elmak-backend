@@ -162,9 +162,20 @@ class MiniWS {
         }
       }
 
-      // 2. Echo / ACK to Sender
+      // 2. Echo to Sender
       if (sender && sockets.has(sender)) {
         for (const client of sockets.get(sender)) {
+          client.send(msg);
+        }
+      }
+      return;
+    }
+
+    // Delivery ACK Forwarding (Double check confirmation from recipient)
+    if (msg.type === 'delivery_ack') {
+      const recipient = (msg.recipient || '').trim().toLowerCase();
+      if (recipient && sockets.has(recipient)) {
+        for (const client of sockets.get(recipient)) {
           client.send(msg);
         }
       }
@@ -612,15 +623,56 @@ function getEmbeddedAppHTML() {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
+          
+          // 1. Delivery ACK from recipient -> Upgrade to Double Check ✓✓
+          if (data.type === 'delivery_ack') {
+            const msgId = data.message_id;
+            for (let u in chats) {
+              const m = chats[u].find(item => item.id === msgId);
+              if (m) {
+                m.status = 'delivered'; // ✓✓
+              }
+            }
+            if (activePeer) renderMessages();
+            return;
+          }
+
+          // 2. Message packet
           if (data.type === 'message') {
-            const sender = data.sender;
-            const text = data.payload?.text || '';
-            const msgId = data.message_id || 'm_' + Date.now();
+            const sender = (data.sender || '').toLowerCase();
+            const recipient = (data.recipient || '').toLowerCase();
+            const isFromMe = (sender === myUser.toLowerCase());
+            const peer = isFromMe ? recipient : sender;
+            const text = data.payload?.text || data.text || '';
+            const msgId = data.client_message_id || data.message_id || 'm_' + Date.now();
             
-            if (!chats[sender]) chats[sender] = [];
-            chats[sender].push({ id: msgId, sender: sender, text: text, time: new Date().toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' }) });
-            renderChatList();
-            if (activePeer === sender) renderMessages();
+            if (!chats[peer]) chats[peer] = [];
+            const existing = chats[peer].find(m => m.id === msgId);
+            if (!existing) {
+              chats[peer].push({
+                id: msgId,
+                sender: sender,
+                text: text,
+                status: isFromMe ? 'sent' : 'delivered',
+                time: new Date().toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' })
+              });
+              renderChatList();
+              if (activePeer === peer) renderMessages();
+
+              // If I received the message, immediately send delivery ACK back!
+              if (!isFromMe && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                  type: 'delivery_ack',
+                  message_id: msgId,
+                  chat_id: data.chat_id || ('chat_' + [sender, recipient].sort().join('_')),
+                  sender: myUser,
+                  recipient: sender
+                }));
+              }
+            } else if (isFromMe) {
+              existing.status = 'sent';
+              if (activePeer === peer) renderMessages();
+            }
           } else if (data.type === 'delete') {
             const msgId = data.message_id;
             for (let u in chats) {
@@ -640,7 +692,7 @@ function getEmbeddedAppHTML() {
       container.innerHTML = '';
       const peers = Object.keys(chats);
       if (peers.length === 0) {
-        container.innerHTML = '<div style="padding: 24px; text-align: center; color: var(--text-muted); font-size: 13px;">لا توجد محادثات سابقة.<br>أدخل اسم مستخدم في الأعلى لبدء المراسلة ⚡</div>';
+        container.innerHTML = '<div style="padding: 32px 16px; text-align: center; color: var(--text-muted); font-size: 13px;">لا توجد محادثات سابقة.<br>أدخل اسم مستخدم في الأعلى لبدء المراسلة المشفرة ⚡</div>';
         return;
       }
       peers.forEach(peer => {
@@ -689,7 +741,8 @@ function getEmbeddedAppHTML() {
       container.innerHTML = '';
       if (!activePeer || !chats[activePeer]) return;
       chats[activePeer].forEach(msg => {
-        const isMe = msg.sender === myUser;
+        const isMe = msg.sender.toLowerCase() === myUser.toLowerCase();
+        const checkMark = msg.status === 'delivered' ? '✓✓' : '✓';
         const div = document.createElement('div');
         div.className = 'msg-bubble ' + (isMe ? 'msg-me' : 'msg-peer');
         div.innerHTML = \`
@@ -697,7 +750,7 @@ function getEmbeddedAppHTML() {
           \${msg.translated ? \`<div style="margin-top:4px; font-size:12px; color:var(--gold); border-top:1px dashed rgba(255,255,255,0.2); padding-top:4px;">✨ ترجمة (\${msg.detected || 'فصحى'}): \${msg.translated}</div>\` : ''}
           <div class="msg-meta">
             <span>\${msg.time}</span>
-            \${isMe ? '<span>✓✓</span>' : ''}
+            \${isMe ? \`<span style="margin-right:4px; font-size:12px;">\${checkMark}</span>\` : ''}
           </div>
           <div class="msg-actions">
             \${!isMe ? \`<button class="action-btn" onclick="translateMsg('\${msg.id}')">✨ ترجمة</button>\` : ''}
@@ -709,15 +762,37 @@ function getEmbeddedAppHTML() {
       container.scrollTop = container.scrollHeight;
     }
 
+    function onInputChange() {
+      const input = document.getElementById('message-input');
+      const btn = document.getElementById('send-action-btn');
+      if (input.value.trim().length > 0) {
+        btn.innerText = '➤';
+        btn.style.background = 'linear-gradient(135deg, #0F5132, #10B981)';
+      } else {
+        btn.innerText = '🎙️';
+        btn.style.background = '#1E293B';
+      }
+    }
+
+    function handleSendOrAudio() {
+      const input = document.getElementById('message-input');
+      if (input.value.trim().length > 0) {
+        sendMessage();
+      } else {
+        alert('اضغط باستمرار للتسجيل الصوتي (ميزة الصوت المشفر)');
+      }
+    }
+
     function sendMessage() {
       const input = document.getElementById('message-input');
       const text = input.value.trim();
       if (!text || !activePeer) return;
       input.value = '';
+      onInputChange();
 
       const msgId = 'msg_' + Date.now();
       const timeStr = new Date().toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
-      const newMsg = { id: msgId, sender: myUser, text: text, time: timeStr };
+      const newMsg = { id: msgId, sender: myUser, text: text, status: 'sent', time: timeStr };
 
       if (!chats[activePeer]) chats[activePeer] = [];
       chats[activePeer].push(newMsg);
@@ -727,10 +802,10 @@ function getEmbeddedAppHTML() {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
           type: 'message',
-          message_id: msgId,
+          client_message_id: msgId,
           recipient: activePeer,
-          chat_id: 'chat_' + activePeer,
-          payload: { text: text }
+          chat_id: 'chat_' + [myUser, activePeer].sort().join('_'),
+          payload: { text: text, cipher: text, type: 'text' }
         }));
       }
     }
@@ -745,7 +820,7 @@ function getEmbeddedAppHTML() {
         ws.send(JSON.stringify({
           type: 'delete',
           message_id: msgId,
-          chat_id: 'chat_' + activePeer
+          chat_id: 'chat_' + [myUser, activePeer].sort().join('_')
         }));
       }
     }
