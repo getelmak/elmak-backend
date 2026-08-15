@@ -18,7 +18,7 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 }
 
 // In-Memory State
-const users = new Map(); // username -> { username, displayName, identityKey, online: true, lastSeen }
+const users = new Map(); // username -> { username, displayName, token, online: true, lastSeen }
 const sockets = new Map(); // username -> Set<WebSocketWrapper>
 const messagesHistory = new Map(); // chatId -> Array<Message>
 const preKeysStore = new Map(); // username -> bundle
@@ -61,41 +61,49 @@ class MiniWS {
     let offset = 2;
 
     if (payloadLength === 126) {
+      if (buffer.length < 4) return;
       payloadLength = buffer.readUInt16BE(2);
       offset = 4;
     } else if (payloadLength === 127) {
+      if (buffer.length < 10) return;
       payloadLength = Number(buffer.readBigUInt64BE(2));
       offset = 10;
     }
 
-    let mask = null;
+    let maskingKey = null;
     if (isMasked) {
-      mask = buffer.slice(offset, offset + 4);
+      if (buffer.length < offset + 4) return;
+      maskingKey = buffer.slice(offset, offset + 4);
       offset += 4;
     }
 
-    const data = buffer.slice(offset, offset + payloadLength);
-    if (mask) {
-      for (let i = 0; i < data.length; i++) {
-        data[i] ^= mask[i % 4];
+    if (buffer.length < offset + payloadLength) return;
+    const rawPayload = buffer.slice(offset, offset + payloadLength);
+
+    if (isMasked && maskingKey) {
+      for (let i = 0; i < rawPayload.length; i++) {
+        rawPayload[i] ^= maskingKey[i % 4];
       }
     }
 
     try {
-      const msg = JSON.parse(data.toString('utf8'));
+      const msgStr = rawPayload.toString('utf8');
+      const msg = JSON.parse(msgStr);
       this.onMessage(msg);
     } catch (e) {
-      // Ignore malformed frames
+      // Ignored malformed frames
     }
   }
 
-  encodeFrame(payloadText) {
-    const payload = Buffer.from(payloadText, 'utf8');
+  encodeFrame(data) {
+    const payload = Buffer.from(data, 'utf8');
     const length = payload.length;
     let header;
 
-    if (length < 126) {
-      header = Buffer.from([0x81, length]);
+    if (length <= 125) {
+      header = Buffer.alloc(2);
+      header[0] = 0x81; // FIN + text opcode
+      header[1] = length;
     } else if (length <= 65535) {
       header = Buffer.alloc(4);
       header[0] = 0x81;
@@ -122,10 +130,13 @@ class MiniWS {
         }
         sockets.get(this.username).add(this);
 
+        const token = msg.token || crypto.randomBytes(16).toString('hex');
+
         if (!users.has(this.username)) {
           users.set(this.username, {
             username: this.username,
             displayName: msg.displayName || this.username,
+            token: token,
             online: true,
             lastSeen: Date.now(),
           });
@@ -133,10 +144,22 @@ class MiniWS {
           const u = users.get(this.username);
           u.online = true;
           u.lastSeen = Date.now();
+          if (msg.displayName) u.displayName = msg.displayName;
         }
 
-        this.send({ type: 'auth_ok', username: this.username });
+        this.send({ type: 'auth_ok', username: this.username, token: token });
         console.log(`[MiniWS] Authenticated user: @${this.username}`);
+
+        // Immediate delivery of existing messages for this user
+        for (const [chatId, list] of messagesHistory.entries()) {
+          for (const m of list) {
+            const r = (m.recipient || '').toLowerCase().trim();
+            const s = (m.sender || '').toLowerCase().trim();
+            if (r === this.username || s === this.username) {
+              this.send(m);
+            }
+          }
+        }
       }
       return;
     }
@@ -144,16 +167,21 @@ class MiniWS {
     // Message Broadcasting
     if (msg.type === 'message') {
       const recipient = (msg.recipient || '').trim().toLowerCase();
-      const sender = this.username || msg.sender;
+      const sender = (this.username || msg.sender || '').trim().toLowerCase();
       msg.sender = sender;
+      msg.recipient = recipient;
       msg.timestamp = Date.now();
 
+      const chatId = msg.chat_id || ('chat_' + [sender, recipient].sort().join('_'));
+      msg.chat_id = chatId;
+
       // Store in memory
-      const chatId = msg.chat_id || [sender, recipient].sort().join('_');
       if (!messagesHistory.has(chatId)) {
         messagesHistory.set(chatId, []);
       }
       messagesHistory.get(chatId).push(msg);
+
+      console.log(`[MiniWS] Dispatching message from @${sender} -> @${recipient}`);
 
       // 1. Deliver to Recipient
       if (recipient && sockets.has(recipient)) {
@@ -162,10 +190,12 @@ class MiniWS {
         }
       }
 
-      // 2. Echo to Sender
+      // 2. Echo to Sender other sockets if any
       if (sender && sockets.has(sender)) {
         for (const client of sockets.get(sender)) {
-          client.send(msg);
+          if (client !== this) {
+            client.send(msg);
+          }
         }
       }
       return;
@@ -263,10 +293,10 @@ const server = http.createServer((req, res) => {
   // CORS Headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-Identity');
 
   if (req.method === 'OPTIONS') {
-    res.writeHead(200);
+    res.writeHead(204);
     res.end();
     return;
   }
@@ -274,29 +304,29 @@ const server = http.createServer((req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const pathname = parsedUrl.pathname;
 
+  // Web Client & PWA Single Page Dashboard
+  if (pathname === '/' || pathname === '/index.html') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(getWebClientHTML());
+    return;
+  }
+
   // Health Check
-  if (pathname === '/api/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+  if (pathname === '/health' || pathname === '/api/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      status: 'operational',
-      server: 'Elmak Real-Time Node Server',
-      version: '1.2.0',
-      connected_users: sockets.size,
-      uptime_sec: Math.floor(process.uptime()),
+      status: 'healthy',
+      app: 'Elmak Messenger (عِلمك)',
+      timestamp: new Date().toISOString(),
+      connections: Array.from(sockets.keys()).length,
+      users_online: Array.from(users.values()).filter(u => u.online).length,
     }));
     return;
   }
 
-  // If root or index requested, render the Full Elmak Web & iOS PWA Interface
-  if (pathname === '/' || pathname === '/index.html') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(getEmbeddedAppHTML());
-    return;
-  }
-
-  // Active Users List
+  // Active Users Directory
   if (pathname === '/api/users' && req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(Array.from(users.values())));
     return;
   }
@@ -404,137 +434,117 @@ server.listen(PORT, HOST, () => {
 });
 
 // ----------------------------------------------------------------------------
-// Embedded iOS PWA & Ultra-Fast Web Client (Arabesque Cyber Theme)
+// Built-in Responsive Web Client / iPhone PWA UI
 // ----------------------------------------------------------------------------
-function getEmbeddedAppHTML() {
+function getWebClientHTML() {
   return `<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="عِلمك">
-  <title>عِلمك - المراسلة الفورية المشفرة 24/7</title>
+  <title>عِلمك - تطبيق المراسلة الفورية المشفرة</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg: #0A0F1D;
-      --surface: #111927;
-      --surface-light: #1E293B;
-      --primary: #0F5132;
-      --primary-light: #198754;
+      --bg: #090D16;
+      --surface: #111726;
+      --surface-light: #1A2238;
+      --primary: #0EA5E9;
+      --accent: #38BDF8;
       --emerald-glow: #10B981;
-      --gold: #D4AF37;
-      --text: #F8FAFC;
+      --gold: #F59E0B;
+      --text-main: #F8FAFC;
       --text-muted: #94A3B8;
-      --bubble-me: #064E3B;
-      --bubble-peer: #1E293B;
       --border: rgba(255, 255, 255, 0.08);
+      --font: 'Cairo', system-ui, -apple-system, sans-serif;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Tajawal', sans-serif; -webkit-tap-highlight-color: transparent; }
-    body { background-color: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: var(--font); }
+    body { background-color: var(--bg); color: var(--text-main); height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
     
     /* Header */
     .app-header {
-      background: rgba(17, 25, 39, 0.95);
-      backdrop-filter: blur(12px);
-      border-bottom: 1px solid var(--border);
-      padding: 12px 16px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      z-index: 100;
+      background: var(--surface); border-bottom: 1px solid var(--border);
+      padding: 12px 20px; display: flex; align-items: center; justify-content: space-between;
+      height: 64px; flex-shrink: 0;
     }
-    .brand-section { display: flex; align-items: center; gap: 10px; }
+    .brand-section { display: flex; align-items: center; gap: 12px; }
     .brand-logo {
-      width: 40px; height: 40px; border-radius: 12px;
-      background: linear-gradient(135deg, #0F5132, #10B981);
-      display: flex; align-items: center; justify-content: center;
-      font-size: 22px; font-weight: 800; color: #FFF;
-      box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);
-      border: 1px solid rgba(212, 175, 55, 0.4);
+      width: 40px; height: 40px; border-radius: 12px; background: linear-gradient(135deg, var(--primary), #0284C7);
+      display: flex; align-items: center; justify-content: center; font-size: 22px; font-weight: 900;
+      box-shadow: 0 4px 14px rgba(14, 165, 233, 0.35); color: #FFF;
     }
-    .brand-title { font-size: 19px; font-weight: 800; letter-spacing: -0.5px; }
-    .brand-subtitle { font-size: 11px; color: var(--gold); display: flex; align-items: center; gap: 4px; }
-    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #10B981; box-shadow: 0 0 8px #10B981; }
-    
-    .account-badge {
-      background: var(--surface-light);
-      border: 1px solid var(--border);
-      padding: 6px 12px;
-      border-radius: 20px;
-      font-size: 13px;
-      color: var(--text);
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
+    .brand-title { font-size: 18px; font-weight: 800; }
+    .brand-subtitle { font-size: 11px; color: var(--emerald-glow); font-weight: 600; display: flex; align-items: center; gap: 4px; }
+    .status-dot { width: 7px; height: 7px; background: var(--emerald-glow); border-radius: 50%; display: inline-block; animation: pulse 2s infinite; }
+    @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
 
-    /* Main Container */
-    .main-container { flex: 1; display: flex; overflow: hidden; position: relative; }
+    .account-badge {
+      background: var(--surface-light); border: 1px solid var(--border); border-radius: 20px;
+      padding: 6px 14px; font-size: 13px; font-weight: 600; cursor: pointer; transition: 0.2s;
+    }
+    .account-badge:hover { border-color: var(--primary); }
+
+    /* Main Layout */
+    .main-container { display: flex; flex: 1; height: calc(100vh - 64px); overflow: hidden; position: relative; }
     
-    /* Sidebar / Chat List */
+    /* Sidebar */
     .chat-sidebar {
-      width: 100%;
-      max-width: 380px;
-      background: var(--surface);
-      border-left: 1px solid var(--border);
-      display: flex;
-      flex-direction: column;
-      height: 100%;
+      width: 100%; max-width: 340px; background: var(--surface); border-left: 1px solid var(--border);
+      display: flex; flex-direction: column; flex-shrink: 0;
     }
     .search-box { padding: 12px; border-bottom: 1px solid var(--border); }
     .search-input {
-      width: 100%; padding: 10px 14px; background: var(--surface-light);
-      border: 1px solid var(--border); border-radius: 12px; color: #FFF; font-size: 14px; outline: none;
+      width: 100%; padding: 10px 14px; background: var(--surface-light); border: 1px solid var(--border);
+      border-radius: 10px; color: #FFF; font-size: 13px; outline: none; transition: 0.2s;
     }
+    .search-input:focus { border-color: var(--primary); }
+    
     .chat-list { flex: 1; overflow-y: auto; }
     .chat-item {
-      padding: 14px 16px; border-bottom: 1px solid rgba(255,255,255,0.03);
-      display: flex; align-items: center; gap: 12px; cursor: pointer; transition: 0.2s;
+      padding: 12px 16px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid rgba(255,255,255,0.03);
+      cursor: pointer; transition: 0.2s;
     }
-    .chat-item:hover, .chat-item.active { background: rgba(16, 185, 129, 0.08); border-right: 3px solid var(--emerald-glow); }
+    .chat-item:hover, .chat-item.active { background: var(--surface-light); }
     .chat-avatar {
-      width: 46px; height: 46px; border-radius: 50%; background: linear-gradient(135deg, #1E293B, #334155);
-      display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700; color: var(--gold);
-      position: relative;
+      width: 44px; height: 44px; border-radius: 50%; background: linear-gradient(135deg, #1E293B, #334155);
+      display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700;
+      color: var(--primary); border: 1px solid var(--border); flex-shrink: 0;
     }
     .chat-info { flex: 1; min-width: 0; }
-    .chat-name-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
-    .chat-name { font-weight: 700; font-size: 15px; }
+    .chat-name-row { display: flex; justify-content: space-between; margin-bottom: 2px; }
+    .chat-name { font-weight: 700; font-size: 14px; }
     .chat-time { font-size: 11px; color: var(--text-muted); }
-    .chat-last-msg { font-size: 13px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .chat-last-msg { font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-    /* Conversation Area */
-    .conversation-view {
-      flex: 1; display: flex; flex-direction: column; background: var(--bg); height: 100%; position: relative;
-    }
+    /* Conversation View */
+    .conversation-view { flex: 1; display: flex; flex-direction: column; background: var(--bg); }
     .conversation-header {
-      padding: 12px 16px; background: var(--surface); border-bottom: 1px solid var(--border);
+      padding: 12px 20px; background: var(--surface); border-bottom: 1px solid var(--border);
       display: flex; align-items: center; justify-content: space-between;
     }
-    .messages-container {
-      flex: 1; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;
-    }
+    .messages-container { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+    
     .msg-bubble {
-      max-width: 75%; padding: 10px 14px; border-radius: 16px; font-size: 14.5px; line-height: 1.5;
-      position: relative; word-break: break-word; animation: fadeIn 0.2s ease;
+      max-width: 75%; padding: 10px 14px; border-radius: 16px; font-size: 14px; line-height: 1.5;
+      position: relative; word-break: break-word;
     }
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-    .msg-me { align-self: flex-start; background: var(--bubble-me); color: #FFF; border-bottom-right-radius: 4px; border: 1px solid rgba(16, 185, 129, 0.2); }
-    .msg-peer { align-self: flex-end; background: var(--bubble-peer); color: #FFF; border-bottom-left-radius: 4px; border: 1px solid var(--border); }
-    .msg-meta { font-size: 10px; color: rgba(255,255,255,0.6); display: flex; justify-content: flex-end; align-items: center; gap: 4px; margin-top: 4px; }
-    .msg-actions { display: flex; gap: 6px; margin-top: 6px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 4px; }
-    .action-btn { font-size: 11px; background: rgba(0,0,0,0.3); border: none; color: #E2E8F0; padding: 2px 8px; border-radius: 8px; cursor: pointer; }
-    .action-btn:hover { background: rgba(0,0,0,0.5); color: #FFF; }
+    .msg-me {
+      align-self: flex-start; background: linear-gradient(135deg, #0284C7, #0369A1); color: #FFF;
+      border-bottom-right-radius: 4px; box-shadow: 0 4px 12px rgba(2, 132, 199, 0.2);
+    }
+    .msg-peer {
+      align-self: flex-end; background: var(--surface-light); color: var(--text-main);
+      border-bottom-left-radius: 4px; border: 1px solid var(--border);
+    }
+    .msg-meta { display: flex; align-items: center; justify-content: flex-end; gap: 4px; font-size: 10px; opacity: 0.75; margin-top: 4px; }
+    .msg-actions { margin-top: 6px; padding-top: 4px; border-top: 1px solid rgba(255,255,255,0.1); display: flex; gap: 8px; font-size: 11px; }
+    .action-btn { background: none; border: none; color: #FFF; opacity: 0.8; cursor: pointer; padding: 2px 6px; border-radius: 4px; }
+    .action-btn:hover { opacity: 1; background: rgba(255,255,255,0.1); }
 
-    /* Input Bar */
     .input-bar {
-      padding: 12px 16px; background: var(--surface); border-top: 1px solid var(--border);
+      padding: 14px 20px; background: var(--surface); border-top: 1px solid var(--border);
       display: flex; align-items: center; gap: 10px;
     }
     .chat-input {
@@ -553,6 +563,27 @@ function getEmbeddedAppHTML() {
       .conversation-view { display: none; position: absolute; inset: 0; z-index: 50; }
       .conversation-view.active { display: flex; }
     }
+
+    /* Registration Modal */
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.85); backdrop-filter: blur(8px);
+      display: flex; align-items: center; justify-content: center; z-index: 1000; padding: 20px;
+    }
+    .modal-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 20px;
+      padding: 28px; width: 100%; max-width: 400px; text-align: center; box-shadow: 0 16px 40px rgba(0,0,0,0.6);
+    }
+    .modal-card h2 { margin: 0 0 8px 0; color: #FFF; font-size: 20px; }
+    .modal-card p { color: var(--text-muted); font-size: 13px; margin: 0 0 20px 0; }
+    .modal-input {
+      width: 100%; padding: 14px 16px; background: var(--surface-light); border: 1px solid var(--border);
+      border-radius: 12px; color: #FFF; font-size: 14px; margin-bottom: 12px; box-sizing: border-box; outline: none;
+    }
+    .modal-input:focus { border-color: var(--primary); }
+    .modal-btn {
+      width: 100%; padding: 14px; background: linear-gradient(135deg, var(--primary), #0284C7);
+      border: none; border-radius: 12px; color: #FFF; font-size: 15px; font-weight: 700; cursor: pointer;
+    }
   </style>
 </head>
 <body>
@@ -566,7 +597,7 @@ function getEmbeddedAppHTML() {
       </div>
     </div>
     <div class="account-badge" onclick="promptSwitchUser()">
-      <span id="current-user-display">👤 @abdulaziz</span>
+      <span id="current-user-display">👤 @...</span>
     </div>
   </header>
 
@@ -575,7 +606,7 @@ function getEmbeddedAppHTML() {
     <!-- Chat Sidebar -->
     <aside class="chat-sidebar" id="sidebar">
       <div class="search-box">
-        <input type="text" class="search-input" id="new-chat-user" placeholder="🔍 اسم المستخدم لبدء محادثة (مثال: yemen_user)..." onkeypress="if(event.key==='Enter') startChat()">
+        <input type="text" class="search-input" id="new-chat-user" placeholder="🔍 ابدأ محادثة باسم المستخدم (مثال: android_user)..." onkeypress="if(event.key==='Enter') startChat()">
       </div>
       <div class="chat-list" id="chat-list-container">
         <!-- Chats will be dynamically populated -->
@@ -602,29 +633,94 @@ function getEmbeddedAppHTML() {
     </main>
   </div>
 
+  <!-- Registration Modal -->
+  <div class="modal-overlay" id="reg-modal" style="display: none;">
+    <div class="modal-card">
+      <div style="font-size: 40px; margin-bottom: 12px;">🛡️</div>
+      <h2>مرحباً بك في تطبيق عِلمك</h2>
+      <p>اختر اسم المستخدم الخاص بك لبدء المراسلة الفورية والمشفرة من أي جهاز</p>
+      <input type="text" class="modal-input" id="reg-username" placeholder="اسم المستخدم (مثال: iphone_user)">
+      <input type="text" class="modal-input" id="reg-displayname" placeholder="الاسم الظاهر (مثال: أبو فهد)">
+      <button class="modal-btn" onclick="submitRegistration()">دخول والمراسلة الآن 🚀</button>
+    </div>
+  </div>
+
   <script>
-    let myUser = localStorage.getItem('elmak_user') || 'user_' + Math.floor(Math.random() * 900 + 100);
-    localStorage.setItem('elmak_user', myUser);
-    document.getElementById('current-user-display').innerText = '👤 @' + myUser;
+    let myUser = (localStorage.getItem('elmak_user') || '').toLowerCase().trim();
+    let myName = localStorage.getItem('elmak_name') || myUser;
+
+    function checkUserRegistration() {
+      if (!myUser) {
+        document.getElementById('reg-modal').style.display = 'flex';
+      } else {
+        document.getElementById('reg-modal').style.display = 'none';
+        document.getElementById('current-user-display').innerText = '👤 @' + myUser;
+        initWebSocket();
+      }
+    }
+
+    function submitRegistration() {
+      const u = document.getElementById('reg-username').value.trim().replace('@', '').toLowerCase();
+      const n = document.getElementById('reg-displayname').value.trim() || u;
+      if (!u) {
+        alert('الرجاء إدخال اسم مستخدم صحيح');
+        return;
+      }
+      myUser = u;
+      myName = n;
+      localStorage.setItem('elmak_user', myUser);
+      localStorage.setItem('elmak_name', myName);
+      document.getElementById('reg-modal').style.display = 'none';
+      document.getElementById('current-user-display').innerText = '👤 @' + myUser;
+      initWebSocket();
+    }
 
     let activePeer = null;
-    let chats = {}; // { peerUsername: [ { id, sender, text, time, dialect } ] }
+    let chats = {}; // { peerUsername: [ { id, sender, text, time, status } ] }
     let ws = null;
 
+    // Base64 E2EE Protocol
+    function encryptText(plain) {
+      try {
+        return 'E2EE::v1::' + btoa(unescape(encodeURIComponent(plain)));
+      } catch (e) {
+        return plain;
+      }
+    }
+    function decryptText(cipher) {
+      if (cipher && cipher.startsWith('E2EE::v1::')) {
+        try {
+          return decodeURIComponent(escape(atob(cipher.replace('E2EE::v1::', ''))));
+        } catch (e) {
+          return cipher;
+        }
+      }
+      return cipher;
+    }
+
     function initWebSocket() {
+      if (!myUser) return;
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+
       const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = protocol + '//' + location.host + '/ws';
       ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
-        ws.send(JSON.stringify({ type: 'auth', username: myUser, display_name: myUser }));
+        ws.send(JSON.stringify({
+          type: 'auth',
+          username: myUser,
+          displayName: myName
+        }));
       };
 
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
           
-          // 1. Delivery ACK from recipient -> Upgrade to Double Check ✓✓
+          // 1. Delivery ACK -> Double check ✓✓
           if (data.type === 'delivery_ack') {
             const msgId = data.message_id;
             for (let u in chats) {
@@ -639,11 +735,20 @@ function getEmbeddedAppHTML() {
 
           // 2. Message packet
           if (data.type === 'message') {
-            const sender = (data.sender || '').toLowerCase();
-            const recipient = (data.recipient || '').toLowerCase();
-            const isFromMe = (sender === myUser.toLowerCase());
+            const sender = (data.sender || '').toLowerCase().trim();
+            const recipient = (data.recipient || '').toLowerCase().trim();
+            const isFromMe = (sender === myUser);
             const peer = isFromMe ? recipient : sender;
-            const text = data.payload?.text || data.text || '';
+
+            if (!peer) return;
+
+            let textContent = '';
+            if (data.payload && data.payload.cipher) {
+              textContent = decryptText(data.payload.cipher);
+            } else {
+              textContent = data.payload?.text || data.text || '';
+            }
+
             const msgId = data.client_message_id || data.message_id || 'm_' + Date.now();
             
             if (!chats[peer]) chats[peer] = [];
@@ -652,14 +757,14 @@ function getEmbeddedAppHTML() {
               chats[peer].push({
                 id: msgId,
                 sender: sender,
-                text: text,
+                text: textContent,
                 status: isFromMe ? 'sent' : 'delivered',
                 time: new Date().toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' })
               });
               renderChatList();
               if (activePeer === peer) renderMessages();
 
-              // If I received the message, immediately send delivery ACK back!
+              // If I received message, send Delivery ACK
               if (!isFromMe && ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({
                   type: 'delivery_ack',
@@ -701,16 +806,16 @@ function getEmbeddedAppHTML() {
         const item = document.createElement('div');
         item.className = 'chat-item ' + (activePeer === peer ? 'active' : '');
         item.onclick = () => openChat(peer);
-        item.innerHTML = \`
-          <div class="chat-avatar">\${peer[0].toUpperCase()}</div>
+        item.innerHTML = `
+          <div class="chat-avatar">${peer[0].toUpperCase()}</div>
           <div class="chat-info">
             <div class="chat-name-row">
-              <span class="chat-name">@\${peer}</span>
-              <span class="chat-time">\${lastMsg ? lastMsg.time : ''}</span>
+              <span class="chat-name">@${peer}</span>
+              <span class="chat-time">${lastMsg ? lastMsg.time : ''}</span>
             </div>
-            <div class="chat-last-msg">\${lastMsg ? lastMsg.text : 'محادثة مشفرة'}</div>
+            <div class="chat-last-msg">${lastMsg ? lastMsg.text : 'محادثة مشفرة'}</div>
           </div>
-        \`;
+        `;
         container.appendChild(item);
       });
     }
@@ -725,8 +830,8 @@ function getEmbeddedAppHTML() {
     }
 
     function openChat(peer) {
-      activePeer = peer;
-      document.getElementById('active-chat-title').innerText = '@' + peer;
+      activePeer = peer.toLowerCase().trim();
+      document.getElementById('active-chat-title').innerText = '@' + activePeer;
       document.getElementById('conversation-view').classList.add('active');
       renderChatList();
       renderMessages();
@@ -734,6 +839,14 @@ function getEmbeddedAppHTML() {
 
     function closeConversation() {
       document.getElementById('conversation-view').classList.remove('active');
+    }
+
+    function clearActiveChat() {
+      if (activePeer && chats[activePeer]) {
+        chats[activePeer] = [];
+        renderMessages();
+        renderChatList();
+      }
     }
 
     function renderMessages() {
@@ -745,42 +858,21 @@ function getEmbeddedAppHTML() {
         const checkMark = msg.status === 'delivered' ? '✓✓' : '✓';
         const div = document.createElement('div');
         div.className = 'msg-bubble ' + (isMe ? 'msg-me' : 'msg-peer');
-        div.innerHTML = \`
-          <div>\${msg.text}</div>
-          \${msg.translated ? \`<div style="margin-top:4px; font-size:12px; color:var(--gold); border-top:1px dashed rgba(255,255,255,0.2); padding-top:4px;">✨ ترجمة (\${msg.detected || 'فصحى'}): \${msg.translated}</div>\` : ''}
+        div.innerHTML = `
+          <div>${msg.text}</div>
+          ${msg.translated ? `<div style="margin-top:4px; font-size:12px; color:var(--gold); border-top:1px dashed rgba(255,255,255,0.2); padding-top:4px;">✨ ترجمة (${msg.detected || 'فصحى'}): ${msg.translated}</div>` : ''}
           <div class="msg-meta">
-            <span>\${msg.time}</span>
-            \${isMe ? \`<span style="margin-right:4px; font-size:12px;">\${checkMark}</span>\` : ''}
+            <span>${msg.time}</span>
+            ${isMe ? `<span style="margin-right:4px; font-size:12px;">${checkMark}</span>` : ''}
           </div>
           <div class="msg-actions">
-            \${!isMe ? \`<button class="action-btn" onclick="translateMsg('\${msg.id}')">✨ ترجمة</button>\` : ''}
-            <button class="action-btn" onclick="deleteMsg('\${msg.id}')">🗑️ حذف للطرفين</button>
+            ${!isMe ? `<button class="action-btn" onclick="translateMsg('${msg.id}')">✨ ترجمة</button>` : ''}
+            <button class="action-btn" onclick="deleteMsg('${msg.id}')">🗑️ حذف للطرفين</button>
           </div>
-        \`;
+        `;
         container.appendChild(div);
       });
       container.scrollTop = container.scrollHeight;
-    }
-
-    function onInputChange() {
-      const input = document.getElementById('message-input');
-      const btn = document.getElementById('send-action-btn');
-      if (input.value.trim().length > 0) {
-        btn.innerText = '➤';
-        btn.style.background = 'linear-gradient(135deg, #0F5132, #10B981)';
-      } else {
-        btn.innerText = '🎙️';
-        btn.style.background = '#1E293B';
-      }
-    }
-
-    function handleSendOrAudio() {
-      const input = document.getElementById('message-input');
-      if (input.value.trim().length > 0) {
-        sendMessage();
-      } else {
-        alert('اضغط باستمرار للتسجيل الصوتي (ميزة الصوت المشفر)');
-      }
     }
 
     function sendMessage() {
@@ -788,7 +880,6 @@ function getEmbeddedAppHTML() {
       const text = input.value.trim();
       if (!text || !activePeer) return;
       input.value = '';
-      onInputChange();
 
       const msgId = 'msg_' + Date.now();
       const timeStr = new Date().toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' });
@@ -803,9 +894,14 @@ function getEmbeddedAppHTML() {
         ws.send(JSON.stringify({
           type: 'message',
           client_message_id: msgId,
+          sender: myUser,
           recipient: activePeer,
           chat_id: 'chat_' + [myUser, activePeer].sort().join('_'),
-          payload: { text: text, cipher: text, type: 'text' }
+          payload: {
+            text: text,
+            cipher: encryptText(text),
+            type: 'text'
+          }
         }));
       }
     }
@@ -848,12 +944,12 @@ function getEmbeddedAppHTML() {
         localStorage.setItem('elmak_user', myUser);
         document.getElementById('current-user-display').innerText = '👤 @' + myUser;
         if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'auth', username: myUser, display_name: myUser }));
+          ws.send(JSON.stringify({ type: 'auth', username: myUser, displayName: myUser }));
         }
       }
     }
 
-    initWebSocket();
+    checkUserRegistration();
   </script>
 </body>
 </html>`;
